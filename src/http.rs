@@ -174,6 +174,7 @@ pub fn status_text(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         501 => "Not Implemented",

@@ -1,4 +1,4 @@
-//! `opurom-server` — a small demo server for smoke testing the runtime.
+//! `opurom-server` - a small demo server for smoke testing the runtime.
 //!
 //! Usage:
 //!   opurom-server [port]
