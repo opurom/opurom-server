@@ -387,14 +387,20 @@ fn main() {
     let mut chain = MiddlewareChain::new();
     chain.push(logging());
     chain.push(body_cap(1024 * 1024));
-    let server = match Server::bind_with(&addr, router, chain, 1024 * 1024) {
+    let server = match Server::bind_from_env(&addr, router, chain, 1024 * 1024) {
         Ok(server) => server,
         Err(err) => {
-            eprintln!("[opurom-service] cannot bind {}: {}", addr, err);
+            eprintln!("[opurom-service] cannot start on {}: {}", addr, err);
             std::process::exit(1);
         }
     };
-    eprintln!("[opurom-service] {} listening on {}", APP_NAME, addr);
+    match server.tls_config() {
+        Some(config) => eprintln!(
+            "[opurom-service] {} listening on https://{} (TLS certificate SHA-256 fingerprint {})",
+            APP_NAME, addr, config.fingerprint()
+        ),
+        None => eprintln!("[opurom-service] {} listening on {}", APP_NAME, addr),
+    }
     server.serve();
 }
 "#;
@@ -840,7 +846,10 @@ fn readme(ir: &Ir) -> String {
     out.push_str("* `OPR_AUTH_TOKEN` - optional development bearer token; missing or mismatched tokens get `401 {\"error\":\"unauthorized\"}`. This is not a production identity system\n");
     out.push_str("* `OPR_CORS` - one fixed `http://` or `https://` origin (or the literal `*`); adds CORS headers and answers `OPTIONS` preflight with `204`\n");
     out.push_str("* `OPR_ETAG=1` - enables ETags alone; any R5 opt-in variable also enables them. `If-None-Match` on GET can answer `304` with no body\n");
-    out.push_str("* `Accept-Encoding: gzip` - request-opt-in gzip for response bodies larger than 1024 bytes; small bodies stay unchanged\n\n");
+    out.push_str("* `Accept-Encoding: gzip` - request-opt-in gzip for response bodies larger than 1024 bytes; small bodies stay unchanged\n");
+    out.push_str("* `OPR_TLS=1` - serves HTTPS on the same address; `OPR_TLS_CERT` and `OPR_TLS_KEY` point at PEM files, and without them a self-signed certificate is generated at startup\n");
+    out.push_str("* `OPR_KEEPALIVE=1` - reuses one connection for several HTTP/1.1 requests; `Connection: close` still ends the connection\n");
+    out.push_str("* `OPR_WEBSOCKET=1` - accepts RFC 6455 WebSocket upgrades\n\n");
     out.push_str("The service opens one `PooledDb` at startup and shares its Mutex-serialized SQLite connection across all handlers. With no optional hardening env vars and no gzip request header, HTTP responses and stdout stay byte-identical. R4 env vars do not enable R5 features.\n\n");
     out.push_str("The schema is created at startup from the embedded `migrations/*.sql`.\n\n");
     out.push_str("## Routes\n\n");
@@ -865,6 +874,6 @@ fn readme(ir: &Ir) -> String {
         }
     }
     out.push_str("\n## Honest status\n\n");
-    out.push_str("One shared Mutex-guarded SQLite connection is not a sized connection pool. Rate limiting is a process-local fixed window, not a distributed rate limit. The bearer token is a development check, not a real auth provider. R6+: TLS, production identity, real connection pool sizing, distributed rate limiting, HTTP keep-alive, streaming, HTTP/2 and compression dictionaries.\n");
+    out.push_str("One shared Mutex-guarded SQLite connection is not a sized connection pool. Rate limiting is a process-local fixed window, not a distributed rate limit. The bearer token is a development check, not a real auth provider. TLS has no client-certificate mTLS, no OCSP/CRL and no certificate revocation, and the WebSocket subset has no permessage-deflate. R8+: production identity, real connection pool sizing, distributed rate limiting, HTTP/2 and HTTP/3, streaming, compression dictionaries.\n");
     out
 }

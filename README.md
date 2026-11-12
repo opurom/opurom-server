@@ -1,15 +1,17 @@
 # opurom-server
 
-OPUROM R2/R4/R5 backend runtime: a small HTTP/1.1 server, a router with path
+OPUROM R2/R4/R5/R7 backend runtime: a small HTTP/1.1 server, a router with path
 parameters, per-route fault isolation, a deterministic SSR host, R4 hardening
 (pooled SQLite, fixed-window rate limiting, structured logs), opt-in R5 HTTP
-features (bearer auth, gzip, ETag, CORS), and `opurom-serverc`, the compiler
+features (bearer auth, gzip, ETag, CORS), opt-in R7 transport features (TLS,
+WebSocket, HTTP/1.1 keep-alive), and `opurom-serverc`, the compiler
 that lowers a full-stack IR into a standalone Rust service crate.
 
 This crate implements the backend half of
 [`FULLSTACK_SPEC.md`](../opurom-spec/FULLSTACK_SPEC.md) sections 4-5,
-[`R4_ADDENDUM.md`](../opurom-spec/R4_ADDENDUM.md) section 6 and
-[`R5_ADDENDUM.md`](../opurom-spec/R5_ADDENDUM.md) section 6.
+[`R4_ADDENDUM.md`](../opurom-spec/R4_ADDENDUM.md) section 6,
+[`R5_ADDENDUM.md`](../opurom-spec/R5_ADDENDUM.md) section 6 and
+[`R7_ADDENDUM.md`](../opurom-spec/R7_ADDENDUM.md) sections 1 and 5.
 
 ## Architecture
 
@@ -36,12 +38,23 @@ TCP connection -> http::read_request
                 -> server::Server optional OPR_LOG_JSON line to stderr
 ```
 
+The R7 transport layer wraps that core:
+
+```
+accept -> optional TLS handshake (rustls, OPR_TLS=1)
+       -> optional WebSocket upgrade (RFC 6455, OPR_WEBSOCKET=1)
+       -> HTTP/1.1 keep-alive loop (OPR_KEEPALIVE=1)
+          Content-Length framing, idle timeout, in-flight limit
+```
+
 | Module | Responsibility |
 | --- | --- |
 | `http` | `Method`, `Request`, `Response`, the bounded request parser, status text |
 | `middleware` | `MiddlewareChain`, `RateLimiter`, logging helpers, body cap, opt-in R5 HTTP options |
 | `router` | route table, `:param` matching, panic isolation, 3-strike breaker |
-| `server` | `TcpListener` accept loop, one thread per connection, `Connection: close`, optional limiter, R5 response features and measured JSON log |
+| `server` | `TcpListener` accept loop, one thread per connection, optional TLS, optional keep-alive, optional WebSocket upgrade, R5 response features and measured JSON log |
+| `tls` | the optional TLS listener: environment configuration, PEM loading, self-signed fallback, SHA-256 fingerprint |
+| `websocket` | the RFC 6455 frame codec with size limits, the server channel and the client helper |
 | `ssr` | deterministic HTML rendering of the IR tree with theme tokens |
 | `ir` | IR v0.1 model: state, tree, theme, models, api |
 | `codegen` | the `opurom-serverc` lowering pass |
@@ -56,13 +69,16 @@ handler is caught, and no failure path aborts the process.
 * Body cap: 1 MiB (`http::MAX_BODY_BYTES`). A larger body gets `413` and the body is
   drained so the client can read the answer.
 * Response: always `Content-Type: application/json` for JSON bodies, `text/html` for
-  SSR, `Content-Length`, and `Connection: close` (no keep-alive in R2). `304`
-  and `204` carry no body and `Content-Length: 0`.
+  SSR, `Content-Length`, and `Connection: close` by default. `304`
+  and `204` carry no body and `Content-Length: 0`. With `OPR_KEEPALIVE=1` the
+  answer carries `Connection: keep-alive` and the connection is reused.
 * Methods: `GET`, `POST`, `PUT`, `DELETE`. `OPTIONS` is a CORS preflight only
   when `OPR_CORS` is set; otherwise the router answers `405` on known paths.
 * R5 features are opt-in. With no R5 environment variable and no
   `Accept-Encoding: gzip`, response bytes stay identical to R4; `Origin`,
   `If-None-Match` and `OPTIONS` request headers alone enable nothing.
+* R7 features are opt-in too. With no `OPR_TLS`, `OPR_KEEPALIVE` and
+  `OPR_WEBSOCKET`, the wire format is byte-identical to R6.
 
 | Situation | Status | Body |
 | --- | --- | --- |
@@ -80,6 +96,7 @@ handler is caught, and no failure path aborts the process.
 | CORS preflight (`OPR_CORS`) | 204 | empty |
 | Handler panic | 500 | `{"error":"handler_panic"}` |
 | Route disabled after 3 panics | 503 | `{"error":"route_disabled"}` |
+| Too many in-flight connections | 503 | `{"error":"server_busy"}` |
 
 Row objects use the model field names exactly; a `bool` field is a JSON boolean.
 
@@ -222,12 +239,148 @@ An unauthorized request still counts against `OPR_RATE_LIMIT` and gets an
 headers compose on one response, and `304` keeps CORS headers but has no
 compressed body. The generated service's one shared `PooledDb` is unchanged.
 
-Still R6+: TLS, a real authentication/identity provider, token lifecycle,
+Still R6+: a real authentication/identity provider, token lifecycle,
 per-route CORS and credentialed CORS, streaming, HTTP/2, compression
-dictionaries, Brotli/zstd, HTTP keep-alive and chunked bodies, a sized
-connection pool and a distributed rate limit. There is no streaming
-compression: each response is encoded in memory. ETags are body hashes, not a
-versioned cache-invalidation system.
+dictionaries, Brotli/zstd, chunked bodies, a sized connection pool and a
+distributed rate limit. There is no streaming compression: each response is
+encoded in memory. ETags are body hashes, not a versioned cache-invalidation
+system.
+
+## R7 transport features (opt-in)
+
+All three R7 features are opt-in and independent. With none of them set the
+server behaves exactly as in R6: plain HTTP, one request per connection,
+`Connection: close` on every response, byte-identical response bytes.
+
+| Variable | Effect |
+| --- | --- |
+| `OPR_TLS=1` | serve HTTPS on the same bind address |
+| `OPR_TLS_CERT` | PEM certificate file for the TLS listener |
+| `OPR_TLS_KEY` | PEM private key file for the TLS listener |
+| `OPR_KEEPALIVE=1` | reuse one connection for several HTTP/1.1 requests |
+| `OPR_WEBSOCKET=1` | accept RFC 6455 WebSocket upgrades |
+
+### TLS listener
+
+`OPR_TLS=1` turns the listener into an HTTPS server on the same bind
+address. The TLS implementation is `rustls` with the `ring` provider; there
+is no OpenSSL dependency and no system TLS library involved.
+
+`OPR_TLS_CERT` and `OPR_TLS_KEY` point at PEM files and must be set
+together. A certificate without a key, or a key without a certificate, is a
+startup error that names the missing variable. A certificate that does not
+match its key is a startup error that says the pair is not usable:
+
+```
+opurom-server: cannot start on 127.0.0.1:8787: the TLS certificate
+cert.pem and private key key.pem do not form a usable pair: invalid peer
+certificate: ...
+```
+
+Without `OPR_TLS_CERT` and `OPR_TLS_KEY` the server generates a self-signed
+certificate at startup with `rcgen`, valid for `localhost`, `127.0.0.1` and
+`::1`. Only the SHA-256 fingerprint of the generated certificate is logged;
+the private key is never written to the log or to disk:
+
+```
+opurom-server demo listening on https://127.0.0.1:8787 (TLS certificate
+SHA-256 fingerprint 9A:F1:...:2C)
+```
+
+A client that does not trust the certificate is refused by the handshake;
+there is no "accept any certificate" mode in the server. A TLS connection
+that ends normally sends `close_notify`, so the peer sees a clean shutdown
+instead of a truncated stream.
+
+```sh
+OPR_TLS=1 cargo run --bin opurom-server -- 8787
+# https://127.0.0.1:8787/health
+```
+
+### WebSocket (RFC 6455)
+
+`OPR_WEBSOCKET=1` accepts RFC 6455 upgrades on any path. The handshake
+answers `101 Switching Protocols` with
+`Sec-WebSocket-Accept: base64(SHA-1(key + 258EAFA5-E914-47DA-95CA-C5AB0DC85B11))`,
+which is the value RFC 6455 section 1.3 documents for the sample key
+`dGhlIHNhbXBsZSBub25jZQ==`: `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`.
+
+The server sends text, binary, ping, pong and close frames, and it
+reassembles fragmented messages (a data frame followed by continuation
+frames). A ping is answered with a pong carrying the same payload. A close
+frame carries a status code and a reason.
+
+`websocket::client::WebSocketClient` is the client-side helper in this
+repository. It performs the handshake, checks the accept value and speaks
+the same frame subset, so a test can talk to the server over a real TCP
+socket.
+
+Frame parsing is bounded on purpose. A frame payload is capped at
+`websocket::MAX_FRAME_PAYLOAD` (1 MiB) and an assembled message at
+`websocket::MAX_MESSAGE_BYTES` (8 MiB). The declared length is checked
+against those limits before any buffer is allocated, so a hostile peer
+cannot make the server allocate without limit. A control frame payload is
+capped at 125 bytes as RFC 6455 requires. Client frames must be masked and
+server frames are never masked.
+
+```rust
+use opurom_server::websocket::client::WebSocketClient;
+
+let mut client = WebSocketClient::connect("127.0.0.1:8787", "/ws")?;
+client.send_text("hello")?;
+```
+
+### HTTP/1.1 keep-alive
+
+`OPR_KEEPALIVE=1` lets one connection carry several HTTP/1.1 requests. The
+response body is framed with `Content-Length`, so the client knows exactly
+where a response ends and can send the next request on the same socket. A
+response carries `Connection: keep-alive`; a request that asks for
+`Connection: close`, and every HTTP/1.0 request without `keep-alive`, gets
+`Connection: close` and the server closes the connection afterwards.
+
+Two bounds keep a long-lived connection from holding resources forever:
+
+* **Idle timeout**: a connection that waits longer than
+  `server::DEFAULT_IDLE_TIMEOUT` (30 seconds) for its next request is
+  closed. The timeout is also the socket read timeout.
+* **Maximum in-flight connections**: at most
+  `server::DEFAULT_MAX_CONNECTIONS` (256) connections are served at the
+  same time. A connection that arrives above the limit gets
+  `503 {"error":"server_busy"}` and is closed.
+
+Both values are settable in code with `Server::with_idle_timeout` and
+`Server::with_max_connections`.
+
+### R7 honest scope
+
+* **No mTLS**: the server never asks for a client certificate. There is no
+  client-certificate verification, no client-certificate revocation and no
+  per-client identity from the TLS layer.
+* **No OCSP and no CRL**: no stapling, no CRL distribution point, no
+  revocation checking of any kind. A revoked certificate is still accepted
+  by a client that trusts it.
+* **No HSM and no cipher-suite tuning**: the cipher suites and the protocol
+  versions are the `rustls` library defaults. There is no configuration for
+  them.
+* **No permessage-deflate**: the WebSocket implementation negotiates no
+  extensions and never compresses a frame. `Sec-WebSocket-Extensions` is
+  neither sent nor honoured.
+* **No HTTP/2 and no HTTP/3**: the server speaks HTTP/1.1 only. There is no
+  ALPN negotiation and no QUIC.
+* **No load-balancer integration**: no `X-Forwarded-*` handling, no
+  `Forwarded` header parsing, no sticky-session or health-probe support for
+  a proxy, and no proxy-protocol support.
+* **No chunked request bodies**: `Transfer-Encoding` is still rejected with
+  `501`, and every response is written with a `Content-Length`.
+* **The self-signed certificate is for development**: it is generated in
+  memory at startup, is not written to disk, and is not rotated.
+* **The keep-alive loop is per connection**: one thread per connection is
+  still the model, so the idle timeout bounds each thread rather than a
+  shared pool.
+* **Still R8+**: OCSP/CRL and certificate revocation, client-certificate
+  mTLS, HTTP/2 and HTTP/3, permessage-deflate, a sized connection pool with
+  a shared event loop, and load-balancer integration.
 
 ## Generated service (`opurom-serverc`)
 
@@ -254,7 +407,9 @@ The generator writes a standalone crate into `<dir>`:
   (default `./opurom.db`). The parent directory of `OPR_DB` is created if
   missing. It also honours `OPR_RATE_LIMIT`, `OPR_LOG_JSON`,
   `OPR_AUTH_TOKEN`, `OPR_CORS` and `OPR_ETAG`, plus request-opt-in gzip,
-  through the runtime described above.
+  through the runtime described above. The R7 transport variables
+  `OPR_TLS`, `OPR_TLS_CERT`, `OPR_TLS_KEY`, `OPR_KEEPALIVE` and
+  `OPR_WEBSOCKET` work the same way.
 * The schema is created at startup inside one `PooledDb::with` call: every
   `migrations/*.sql` statement is embedded with `include_str!` and executed
   (they are `CREATE TABLE IF NOT EXISTS`, so startup is idempotent).
@@ -268,7 +423,7 @@ OPR_PORT=8787 OPR_DB=./opurom.db <dir>/target/release/opurom-service
 
 The generated service no longer opens one connection per request. It shares
 the one Mutex-serialized connection from `PooledDb`; real connection pool
-sizing remains R6+.
+sizing remains R8+.
 
 ## Demo server
 
@@ -278,18 +433,43 @@ cargo run --bin opurom-server -- 8787      # or: OPR_PORT=8787 cargo run --bin o
 
 The demo serves `/health`, `/ssr` and an in-memory `/todos` collection with the
 five CRUD verbs. It uses the same optional rate limiter, structured logging
-and opt-in R5 HTTP features as generated services.
+and opt-in R5 HTTP features as generated services, and it understands the
+opt-in R7 transport variables:
+
+```sh
+OPR_TLS=1 OPR_KEEPALIVE=1 OPR_WEBSOCKET=1 cargo run --bin opurom-server -- 8787
+```
+
+## Dependencies
+
+The R7 transport features add seven pinned dependencies. Every version is
+pinned with `=` so a rebuild cannot pull a different release.
+
+| Crate | Version | Why |
+| --- | --- | --- |
+| `rustls` | 0.23.46 | the TLS 1.2/1.3 implementation, with the `ring` provider and no OpenSSL |
+| `rustls-pemfile` | 2.2.0 | reading the PEM certificate and private key files |
+| `rcgen` | 0.14.10 | generating the self-signed certificate at startup |
+| `sha2` | 0.10.9 | the SHA-256 certificate fingerprint that is logged |
+| `sha1` | 0.10.6 | the SHA-1 of the WebSocket handshake key, as RFC 6455 requires |
+| `base64` | 0.23.1 | the base64 handshake accept value and the client key |
+| `getrandom` | 0.2.17 | the random bytes for a WebSocket key and for a frame mask |
+
+`rcgen` is built with `default-features = false` and only the `crypto`,
+`pem` and `ring` features, so its optional `x509-parser` and `aws-lc-rs`
+paths are not compiled in. `rustls` is built with `default-features = false`
+and only `ring`, `std`, `tls12` and `logging`, so no system TLS library is
+needed.
 
 ## Tests
 
 ```sh
 cargo fmt --all
-cargo test --offline
+cargo test
 ```
 
-The original 24 tests remain green and `tests/http_features.rs` adds 13 R5
-tests, for 37 total. Several suites drive a real server on an ephemeral port
-over TCP:
+The 37 R6 tests remain green and the R7 suites add 30 more, for 67 in
+total. Several suites drive a real server on an ephemeral port over TCP:
 
 | Test file | Covers |
 | --- | --- |
@@ -298,6 +478,9 @@ over TCP:
 | `tests/codegen.rs` | generated crate shape, migration SQL, deterministic lowering, IR validation, one shared `PooledDb` in generated code |
 | `tests/hardening.rs` | deterministic N/N+1 rate-limit boundary and window reset, `OPR_RATE_LIMIT` over TCP, JSON log shape with numeric measured `elapsed_ms`, one JSON stderr line per request, byte-identical default responses |
 | `tests/http_features.rs` | 401/304/204 status and body paths, gzip bytes decompressed to the original JSON, exact 1024-byte threshold, fixed CORS headers/preflight, deterministic ETag over TCP, all-feature composition, unauthorized and preflight rate-limit/log composition, default-off wire bytes |
+| `tests/tls.rs` | a real TLS handshake over a real socket, an untrusted certificate refused by the client, the SHA-256 fingerprint and the private key never logged, a missing certificate file, a certificate without a key naming the missing variable, a corrupt PEM, a mismatched certificate and key pair, the demo server exiting with a clear error, plain HTTP staying byte-identical |
+| `tests/websocket.rs` | the RFC 6455 handshake with the documented accept value, a text frame round trip, a binary frame round trip, ping answered with pong, a close frame with its code and reason, a message reassembled from two fragments, a message reassembled from three fragments, an oversized frame refused before allocation, an unmasked client frame refused, the client refusing a wrong accept value and a non-101 answer |
+| `tests/keepalive.rs` | two requests on one socket, a `Connection: close` request ending the connection, the idle timeout closing a silent connection, the in-flight limit answering 503, the documented default limits, the demo server with and without `OPR_KEEPALIVE` |
 
 The in-process tests are self-contained: they use an in-memory store, not
 `opurom-db`, so `cargo test` passes in this repository on its own. The
@@ -324,18 +507,25 @@ Implemented and verified in this repository:
 | ETag / `304` | Implemented, opt-in deterministic body hash, empty-body conditional response over TCP |
 | CORS / preflight | Implemented, opt-in fixed origin or literal `*`, 204 with fixed allow lists |
 | `opurom-serverc` lowering to a standalone crate | Implemented, tested |
+| TLS listener | Implemented, opt-in via `OPR_TLS=1`, rustls with a self-signed fallback, fingerprint logged, real handshake tested |
+| WebSocket (RFC 6455) | Implemented, opt-in via `OPR_WEBSOCKET=1`, handshake, text, binary, ping/pong, close and fragmentation, bounded frames |
+| HTTP/1.1 keep-alive | Implemented, opt-in via `OPR_KEEPALIVE=1`, `Content-Length` framing, idle timeout, in-flight limit |
 
-Not implemented (R6+):
+Not implemented (R8+):
 
 | Area | Status |
 | --- | --- |
-| TLS | Not implemented |
+| Client-certificate mTLS | Not implemented (the server never asks for a client certificate) |
+| OCSP / CRL / certificate revocation | Not implemented (no stapling, no CRL, no revocation checking) |
+| `permessage-deflate` | Not implemented (no extension is negotiated, no frame is compressed) |
+| HTTP/2 and HTTP/3 | Not implemented (HTTP/1.1 only, no ALPN, no QUIC) |
+| Load-balancer integration | Not implemented (no `X-Forwarded-*`, no `Forwarded`, no proxy protocol) |
 | Real authentication provider / token lifecycle | Not implemented (development bearer token only) |
-| Real connection pool sizing | Not implemented (one shared Mutex-guarded connection only) |
+| Real connection pool sizing | Not implemented (one shared Mutex-guarded connection only, one thread per connection) |
 | Distributed rate limiting | Not implemented (in-process counters only) |
 | PostgreSQL / MySQL drivers | Not implemented in this repository (SQLite and the `opurom-db` KV/Memory drivers only) |
 | Node.js / Serverless deployment | Not implemented |
 | Per-route CORS, credentialed CORS | Not implemented (one fixed configured origin or `*`; no cookies or credentials) |
-| Streaming, HTTP/2, compression dictionaries | Not implemented (whole-body gzip only, HTTP/1.1 with `Connection: close`) |
+| Streaming, HTTP/2, compression dictionaries | Not implemented (whole-body gzip only) |
 | Real device benchmarks | Not implemented; no fabricated numbers |
-| HTTP keep-alive, chunked bodies | Not implemented (R2 closes every connection) |
+| Chunked request bodies | Not implemented (`Transfer-Encoding` is still rejected with 501) |

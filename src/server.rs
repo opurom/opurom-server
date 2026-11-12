@@ -1,12 +1,25 @@
 //! Thread-per-connection HTTP/1.1 server over `std::net::TcpListener`.
+//!
+//! The listener serves plain HTTP by default and every default response byte
+//! stays identical to R6. Three opt-in features change that:
+//!
+//! * `OPR_TLS=1` serves HTTPS on the same bind address.
+//! * `OPR_KEEPALIVE=1` reuses a connection for several HTTP/1.1 requests.
+//! * `OPR_WEBSOCKET=1` accepts RFC 6455 upgrades.
+//!
+//! Connections are bounded by an idle timeout and a maximum number of
+//! in-flight connections.
 
 use std::collections::BTreeMap;
-use std::io::{BufReader, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use rustls::server::ServerConnection;
+use rustls::StreamOwned;
 
 use crate::http::{read_request, status_text, Request, Response, MAX_BODY_BYTES};
 use crate::middleware::{
@@ -14,6 +27,23 @@ use crate::middleware::{
     structured_logging_enabled, unauthorized_response, HttpOptions, MiddlewareChain, RateLimiter,
 };
 use crate::router::Router;
+use crate::tls::{self, TlsConfig};
+use crate::websocket::{self, ServerChannel, WsChannel};
+
+/// Environment variable that enables the TLS listener.
+pub const TLS_ENV: &str = "OPR_TLS";
+
+/// Environment variable that enables HTTP/1.1 keep-alive.
+pub const KEEP_ALIVE_ENV: &str = "OPR_KEEPALIVE";
+
+/// Environment variable that enables WebSocket upgrades.
+pub const WEBSOCKET_ENV: &str = "OPR_WEBSOCKET";
+
+/// Default idle timeout of a kept-alive connection.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default maximum number of connections served at the same time.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
 /// A running HTTP server.
 pub struct Server {
@@ -24,6 +54,12 @@ pub struct Server {
     options: Arc<HttpOptions>,
     max_body: usize,
     shutdown: Arc<AtomicBool>,
+    tls: Option<Arc<TlsConfig>>,
+    keep_alive: bool,
+    websocket: bool,
+    idle_timeout: Duration,
+    max_connections: usize,
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl Server {
@@ -39,6 +75,50 @@ impl Server {
         middleware: MiddlewareChain,
         max_body: usize,
     ) -> std::io::Result<Server> {
+        Server::build(addr, router, middleware, max_body, None)
+    }
+
+    /// Bind a TLS server. The certificate comes from `config`; when it is
+    /// `None` a self-signed certificate is generated at startup.
+    pub fn bind_tls(
+        addr: &str,
+        router: Router,
+        middleware: MiddlewareChain,
+        max_body: usize,
+        config: Option<TlsConfig>,
+    ) -> Result<Server, String> {
+        let config = match config {
+            Some(config) => config,
+            None => tls::self_signed_config().map_err(|err| err.to_string())?,
+        };
+        Server::build(addr, router, middleware, max_body, Some(config))
+            .map_err(|err| err.to_string())
+    }
+
+    /// Bind with the TLS configuration described by the environment. Without
+    /// `OPR_TLS` the server is a plain HTTP server.
+    pub fn bind_from_env(
+        addr: &str,
+        router: Router,
+        middleware: MiddlewareChain,
+        max_body: usize,
+    ) -> Result<Server, String> {
+        let config = if tls::tls_enabled() {
+            Some(tls::config_from_env().map_err(|err| err.to_string())?)
+        } else {
+            None
+        };
+        Server::build(addr, router, middleware, max_body, config).map_err(|err| err.to_string())
+    }
+
+    /// The shared implementation of every `bind` variant.
+    fn build(
+        addr: &str,
+        router: Router,
+        middleware: MiddlewareChain,
+        max_body: usize,
+        tls_config: Option<TlsConfig>,
+    ) -> std::io::Result<Server> {
         let listener = TcpListener::bind(addr)?;
         Ok(Server {
             listener,
@@ -48,11 +128,41 @@ impl Server {
             options: Arc::new(HttpOptions::from_env()),
             max_body,
             shutdown: Arc::new(AtomicBool::new(false)),
+            tls: tls_config.map(Arc::new),
+            keep_alive: truthy_env(KEEP_ALIVE_ENV),
+            websocket: truthy_env(WEBSOCKET_ENV),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            in_flight: Arc::new(AtomicUsize::new(0)),
         })
     }
 
+    /// Set the idle timeout of a kept-alive connection.
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Server {
+        self.idle_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum number of connections served at the same time.
+    pub fn with_max_connections(mut self, limit: usize) -> Server {
+        self.max_connections = limit;
+        self
+    }
+
+    /// Enable WebSocket upgrades on this server.
+    pub fn with_websocket(mut self) -> Server {
+        self.websocket = true;
+        self
+    }
+
+    /// Enable HTTP/1.1 keep-alive on this server.
+    pub fn with_keep_alive(mut self) -> Server {
+        self.keep_alive = true;
+        self
+    }
+
     /// The bound address, useful when binding to port 0.
-    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
     }
 
@@ -61,33 +171,73 @@ impl Server {
         Arc::clone(&self.shutdown)
     }
 
+    /// The TLS configuration of this server, when it has one.
+    pub fn tls_config(&self) -> Option<&Arc<TlsConfig>> {
+        self.tls.as_ref()
+    }
+
+    /// True when HTTP/1.1 keep-alive is enabled for this server.
+    pub fn keep_alive_enabled(&self) -> bool {
+        self.keep_alive
+    }
+
+    /// True when WebSocket upgrades are enabled for this server.
+    pub fn websocket_enabled(&self) -> bool {
+        self.websocket
+    }
+
     /// Serve until the shutdown handle is set. One thread per connection.
     pub fn serve(&self) {
         for stream in self.listener.incoming() {
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
             }
-            match stream {
-                Ok(stream) => {
-                    let router = Arc::clone(&self.router);
-                    let middleware = Arc::clone(&self.middleware);
-                    let limiter = self.limiter.clone();
-                    let options = Arc::clone(&self.options);
-                    let max_body = self.max_body;
-                    let shutdown = Arc::clone(&self.shutdown);
-                    thread::spawn(move || {
-                        let _ = handle_connection(
-                            stream, router, middleware, limiter, options, max_body, shutdown,
-                        );
-                    });
+            let stream = match stream {
+                Ok(stream) => stream,
+                Err(err) => {
+                    eprintln!("[opurom-server] accept failed: {}", err);
+                    continue;
                 }
-                Err(err) => eprintln!("[opurom-server] accept failed: {}", err),
+            };
+            let router = Arc::clone(&self.router);
+            let middleware = Arc::clone(&self.middleware);
+            let limiter = self.limiter.clone();
+            let options = Arc::clone(&self.options);
+            let max_body = self.max_body;
+            let tls_config = self.tls.clone();
+            let idle_timeout = self.idle_timeout;
+            let keep_alive = self.keep_alive;
+            let websocket = self.websocket;
+            let in_flight = Arc::clone(&self.in_flight);
+            let current = in_flight.fetch_add(1, Ordering::Relaxed);
+            if current >= self.max_connections {
+                in_flight.fetch_sub(1, Ordering::Relaxed);
+                // The in-flight limit is reached: answer with 503 and close.
+                let _ = reject_connection(stream);
+                continue;
             }
+            thread::spawn(move || {
+                let _ = handle_connection(
+                    stream,
+                    Connection {
+                        router,
+                        middleware,
+                        limiter,
+                        options,
+                        max_body,
+                        tls_config,
+                        idle_timeout,
+                        keep_alive,
+                        websocket,
+                    },
+                );
+                in_flight.fetch_sub(1, Ordering::Relaxed);
+            });
         }
     }
 
     /// Serve in a background thread and return the bound address.
-    pub fn spawn(self) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicBool>)> {
+    pub fn spawn(self) -> std::io::Result<(SocketAddr, Arc<AtomicBool>)> {
         let addr = self.local_addr()?;
         let shutdown = self.shutdown_handle();
         thread::spawn(move || {
@@ -97,67 +247,225 @@ impl Server {
     }
 }
 
-/// Read one request, run the middleware chain and the router, write the answer.
-fn handle_connection(
-    stream: TcpStream,
+/// True when an environment flag is set to a truthy value.
+fn truthy_env(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Answer a connection that arrives while the in-flight limit is reached.
+fn reject_connection(mut stream: TcpStream) -> std::io::Result<()> {
+    let response = Response::error(503, "server_busy");
+    write_response(&mut stream, &response)
+}
+
+/// One connection transport: plain TCP or TLS.
+enum Transport {
+    Plain(TcpStream),
+    Tls(Option<Box<StreamOwned<ServerConnection, TcpStream>>>),
+}
+
+impl Read for Transport {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Transport::Plain(stream) => stream.read(buf),
+            Transport::Tls(stream) => match stream {
+                Some(stream) => stream.read(buf),
+                None => Ok(0),
+            },
+        }
+    }
+}
+
+impl Write for Transport {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Transport::Plain(stream) => stream.write(buf),
+            Transport::Tls(stream) => match stream {
+                Some(stream) => stream.write(buf),
+                None => Ok(0),
+            },
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Transport::Plain(stream) => stream.flush(),
+            Transport::Tls(stream) => match stream {
+                Some(stream) => stream.flush(),
+                None => Ok(()),
+            },
+        }
+    }
+}
+
+impl Transport {
+    /// Close the connection. A TLS connection sends `close_notify` first so
+    /// the peer sees a clean shutdown instead of a truncated stream.
+    fn shutdown(&mut self) -> std::io::Result<()> {
+        match self {
+            Transport::Plain(stream) => stream.flush(),
+            Transport::Tls(stream) => {
+                let Some(owned) = stream.take() else {
+                    return Ok(());
+                };
+                let (mut connection, mut socket) = owned.into_parts();
+                connection.send_close_notify();
+                connection.complete_io(&mut socket).map(|_| ())
+            }
+        }
+    }
+}
+
+/// The shared state one connection handler needs.
+struct Connection {
     router: Arc<Router>,
     middleware: Arc<MiddlewareChain>,
     limiter: Option<Arc<RateLimiter>>,
     options: Arc<HttpOptions>,
     max_body: usize,
-    shutdown: Arc<AtomicBool>,
-) -> std::io::Result<()> {
-    let _ = shutdown;
-    let started = Instant::now();
-    let mut writer = stream.try_clone()?;
-    let mut reader = BufReader::new(stream);
-    let (response, method, path) = match read_request(&mut reader, max_body) {
-        Ok(mut request) => {
-            let method = request.method.as_str().to_string();
-            let path = request.path.clone();
-            let mut response = match middleware.apply(&mut request) {
-                Some(response) => response,
-                None => match limiter.as_ref().and_then(|limiter| limiter.check(&request)) {
-                    Some(retry_after) => rate_limited_response(retry_after),
-                    None => {
-                        if let Some(preflight) =
-                            cors_preflight(&request, options.cors_origin.as_deref())
-                        {
-                            preflight
-                        } else if options
-                            .auth_token
-                            .as_deref()
-                            .is_some_and(|token| !authorized(&request, token))
-                        {
-                            unauthorized_response()
-                        } else {
-                            router.handle(&mut request)
-                        }
-                    }
-                },
-            };
-            apply_response_features(&mut response, &request, options.as_ref());
-            (response, method, path)
-        }
-        Err(err) => (
-            Response::error(err.status, &err.message),
-            "-".to_string(),
-            "-".to_string(),
-        ),
-    };
-    let result = write_response(&mut writer, &response);
-    if structured_logging_enabled() {
-        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        eprintln!(
-            "{}",
-            request_log_line(&method, &path, response.status, elapsed_ms)
-        );
-    }
-    result
+    tls_config: Option<Arc<TlsConfig>>,
+    idle_timeout: Duration,
+    keep_alive: bool,
+    websocket: bool,
 }
 
-/// Write the response and close the connection (no keep-alive in R2).
+/// Serve one connection: read requests until the peer closes, the client
+/// asks for `Connection: close`, or the idle timeout expires.
+fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Result<()> {
+    let Connection {
+        router,
+        middleware,
+        limiter,
+        options,
+        max_body,
+        tls_config,
+        idle_timeout,
+        keep_alive,
+        websocket,
+    } = connection;
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(idle_timeout));
+
+    let transport = match tls_config {
+        Some(config) => match config.connect() {
+            Ok(connection) => Transport::Tls(Some(Box::new(StreamOwned::new(connection, stream)))),
+            Err(err) => {
+                eprintln!("[opurom-server] TLS handshake failed: {}", err);
+                return Ok(());
+            }
+        },
+        None => Transport::Plain(stream),
+    };
+
+    // One connection serves many requests; the reader keeps the bytes the
+    // HTTP parser already read so a WebSocket upgrade can use them.
+    let mut reader = BufReader::new(transport);
+
+    loop {
+        // A closed connection ends the loop without an answer.
+        match reader.fill_buf() {
+            Ok(buffer) if buffer.is_empty() => return Ok(()),
+            Ok(_) => {}
+            Err(err) => return Err(err),
+        }
+
+        let started = Instant::now();
+        let (response, method, path, reuse) = match read_request(&mut reader, max_body) {
+            Ok(mut request) => {
+                // A WebSocket upgrade takes over the connection.
+                if websocket {
+                    if let Some(key) = websocket::upgrade_key(&request) {
+                        return serve_websocket(&mut reader, key);
+                    }
+                }
+                let method = request.method.as_str().to_string();
+                let path = request.path.clone();
+                let mut response = match middleware.apply(&mut request) {
+                    Some(response) => response,
+                    None => match limiter.as_ref().and_then(|limiter| limiter.check(&request)) {
+                        Some(retry_after) => rate_limited_response(retry_after),
+                        None => {
+                            if let Some(preflight) =
+                                cors_preflight(&request, options.cors_origin.as_deref())
+                            {
+                                preflight
+                            } else if options
+                                .auth_token
+                                .as_deref()
+                                .is_some_and(|token| !authorized(&request, token))
+                            {
+                                unauthorized_response()
+                            } else {
+                                router.handle(&mut request)
+                            }
+                        }
+                    },
+                };
+                apply_response_features(&mut response, &request, options.as_ref());
+                let reuse = keep_alive && wants_keep_alive(&request);
+                (response, method, path, reuse)
+            }
+            Err(err) => (
+                Response::error(err.status, &err.message),
+                "-".to_string(),
+                "-".to_string(),
+                false,
+            ),
+        };
+        let result = write_response_with(&mut reader.get_mut(), &response, reuse);
+        if structured_logging_enabled() {
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            eprintln!(
+                "{}",
+                request_log_line(&method, &path, response.status, elapsed_ms)
+            );
+        }
+        result?;
+        if !reuse {
+            // A TLS peer must see a clean `close_notify` instead of a
+            // truncated stream.
+            let _ = reader.get_mut().shutdown();
+            return Ok(());
+        }
+    }
+}
+
+/// True when the request may be answered on the same connection.
+fn wants_keep_alive(request: &Request) -> bool {
+    let connection = request.header("Connection").unwrap_or("");
+    if connection
+        .split(',')
+        .any(|value| value.trim().eq_ignore_ascii_case("close"))
+    {
+        return false;
+    }
+    if request.version == "HTTP/1.0" {
+        // HTTP/1.0 clients close unless they ask to keep the connection.
+        return connection
+            .split(',')
+            .any(|value| value.trim().eq_ignore_ascii_case("keep-alive"));
+    }
+    true
+}
+
+/// Write the response and close the connection. This is the R2 wire format
+/// and stays byte-identical.
 pub fn write_response<W: Write>(writer: &mut W, response: &Response) -> std::io::Result<()> {
+    write_response_with(writer, response, false)
+}
+
+/// Write the response. With `keep_alive` the answer carries
+/// `Connection: keep-alive`, otherwise `Connection: close` as in R2.
+pub fn write_response_with<W: Write>(
+    writer: &mut W,
+    response: &Response,
+    keep_alive: bool,
+) -> std::io::Result<()> {
     let mut head = format!(
         "HTTP/1.1 {} {}\r\n",
         response.status,
@@ -170,10 +478,47 @@ pub fn write_response<W: Write>(writer: &mut W, response: &Response) -> std::io:
         head.push_str("\r\n");
     }
     head.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
-    head.push_str("Connection: close\r\n\r\n");
+    head.push_str(if keep_alive {
+        "Connection: keep-alive\r\n\r\n"
+    } else {
+        "Connection: close\r\n\r\n"
+    });
     writer.write_all(head.as_bytes())?;
     writer.write_all(&response.body)?;
     writer.flush()
+}
+
+/// Serve the WebSocket side of one connection after a successful handshake.
+///
+/// The bytes the HTTP parser already buffered belong to the WebSocket
+/// stream, so they are handed to the channel instead of the socket.
+fn serve_websocket<R: Read + Write>(reader: &mut BufReader<R>, key: &str) -> std::io::Result<()> {
+    reader
+        .get_mut()
+        .write_all(&websocket::handshake_response(key))?;
+    reader.get_mut().flush()?;
+    let prefix = reader.buffer().to_vec();
+    let mut channel = ServerChannel::new(reader.get_mut(), prefix);
+    while let Ok(message) = channel.recv() {
+        match message {
+            websocket::WsMessage::Text(text) => {
+                if channel.send_text(&text).is_err() {
+                    break;
+                }
+            }
+            websocket::WsMessage::Binary(data) => {
+                if channel.send_binary(&data).is_err() {
+                    break;
+                }
+            }
+            websocket::WsMessage::Close { code, reason } => {
+                let _ = channel.send_close(code, &reason);
+                break;
+            }
+            websocket::WsMessage::Pong(_) | websocket::WsMessage::Ping(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Convenience helper: build a request that targets `path` with `method`.
@@ -185,5 +530,6 @@ pub fn request_for(method: crate::http::Method, path: &str, body: &str) -> Reque
         headers: vec![("Content-Type".to_string(), "application/json".to_string())],
         body: body.as_bytes().to_vec(),
         params: BTreeMap::new(),
+        version: "HTTP/1.1".to_string(),
     }
 }
