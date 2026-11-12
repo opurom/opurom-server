@@ -1,0 +1,52 @@
+{
+  "ir": "0.1",
+  "app": "TodoApp",
+  "state": [
+    { "name": "remaining", "type": "int", "init": 0 }
+  ],
+  "tree": {
+    "id": 0,
+    "kind": "Column",
+    "props": { "gap": 8, "padding": 16, "align": "center" },
+    "children": [
+      {
+        "id": 1,
+        "kind": "Text",
+        "props": { "value": "Remaining: {remaining}", "size": 24 },
+        "children": [],
+        "events": {}
+      },
+      {
+        "id": 2,
+        "kind": "Row",
+        "props": { "gap": 8 },
+        "children": [
+          {
+            "id": 3,
+            "kind": "Button",
+            "props": { "label": "Refresh" },
+            "children": [],
+            "events": { "tap": { "op": "add", "target": "remaining", "value": 1 } }
+          }
+        ],
+        "events": {}
+      }
+    ],
+    "events": {}
+  },
+  "theme": { "mode": "system", "accent": "#4F46E5", "radius": 12 },
+  "models": [
+    {
+      "name": "Todo",
+      "fields": [
+        { "name": "id", "type": "int", "primary": true, "default": null },
+        { "name": "title", "type": "string", "primary": false, "default": null },
+        { "name": "done", "type": "bool", "primary": false, "default": false }
+      ]
+    }
+  ],
+  "api": [
+    { "path": "/todos", "model": "Todo", "handlers": ["list", "create"] },
+    { "path": "/todos/:id", "model": "Todo", "handlers": ["get", "update", "delete"] }
+  ]
+}
