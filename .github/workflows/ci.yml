@@ -34,5 +34,20 @@ jobs:
       - name: Install libsqlite3-dev
         if: matrix.check == 'rust-test'
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      # Cross-repository tests need the sibling projects that this one depends
+      # on. They are cloned next to the checkout, exactly like the local layout:
+      # the repository under test stays in $GITHUB_WORKSPACE, the siblings land
+      # in its parent directory, so a relative "../opurom-spec/..." resolves.
+      - name: Checkout sibling repositories
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/.."
+          for repo in opurom-spec opurom-lang opurom-core opurom-render opurom-platform opurom-server opurom-db opurom-runtime-adapters opurom-plugins opurom-cli; do
+            url="https://github.com/opurom/${repo}.git"
+            if [ "$repo" != "$(basename "$GITHUB_WORKSPACE")" ] && git ls-remote --exit-code "$url" >/dev/null 2>&1; then
+              git clone --depth 1 "$url" "$repo" || true
+            fi
+          done
+          ls -1
       - name: Run ${{ matrix.check }}
         run: node .github/scripts/ci-check.mjs ${{ matrix.check }}
