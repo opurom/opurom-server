@@ -31,5 +31,8 @@ jobs:
         with:
           components: rustfmt
           targets: wasm32-unknown-unknown
+      - name: Install libsqlite3-dev
+        if: matrix.check == 'rust-test'
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - name: Run ${{ matrix.check }}
         run: node .github/scripts/ci-check.mjs ${{ matrix.check }}
