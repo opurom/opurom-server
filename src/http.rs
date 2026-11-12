@@ -319,7 +319,7 @@ fn drain<R: BufRead>(reader: &mut R, count: usize) {
 }
 
 /// Collapse repeated slashes and drop a trailing slash (except at the root).
-fn normalize_path(path: &str) -> String {
+pub(crate) fn normalize_path(path: &str) -> String {
     let mut out = String::from("/");
     for segment in path.split('/').filter(|s| !s.is_empty()) {
         out.push_str(&percent_decode(segment));
