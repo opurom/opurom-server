@@ -836,8 +836,12 @@ fn readme(ir: &Ir) -> String {
     out.push_str("* `OPR_PORT` - listen port (default `8787`)\n");
     out.push_str("* `OPR_DB` - SQLite database path (default `./opurom.db`)\n");
     out.push_str("* `OPR_RATE_LIMIT` - optional positive integer requests per method and path per 60-second window; excess requests get `429` JSON and `Retry-After` seconds\n");
-    out.push_str("* `OPR_LOG_JSON=1` - one JSON line per request to stderr with `method`, `path`, `status` and measured `elapsed_ms`; replaces the plain log line\n\n");
-    out.push_str("The service opens one `PooledDb` at startup and shares its Mutex-serialized SQLite connection across all handlers. With no optional hardening env vars set, HTTP responses and stdout stay unchanged.\n\n");
+    out.push_str("* `OPR_LOG_JSON=1` - one JSON line per request to stderr with `method`, `path`, `status` and measured `elapsed_ms`; replaces the plain log line\n");
+    out.push_str("* `OPR_AUTH_TOKEN` - optional development bearer token; missing or mismatched tokens get `401 {\"error\":\"unauthorized\"}`. This is not a production identity system\n");
+    out.push_str("* `OPR_CORS` - one fixed `http://` or `https://` origin (or the literal `*`); adds CORS headers and answers `OPTIONS` preflight with `204`\n");
+    out.push_str("* `OPR_ETAG=1` - enables ETags alone; any R5 opt-in variable also enables them. `If-None-Match` on GET can answer `304` with no body\n");
+    out.push_str("* `Accept-Encoding: gzip` - request-opt-in gzip for response bodies larger than 1024 bytes; small bodies stay unchanged\n\n");
+    out.push_str("The service opens one `PooledDb` at startup and shares its Mutex-serialized SQLite connection across all handlers. With no optional hardening env vars and no gzip request header, HTTP responses and stdout stay byte-identical. R4 env vars do not enable R5 features.\n\n");
     out.push_str("The schema is created at startup from the embedded `migrations/*.sql`.\n\n");
     out.push_str("## Routes\n\n");
     out.push_str("* `GET /health` - `{\"ok\":true,\"app\":\"...\",\"version\":\"0.2.0\"}`\n");
@@ -861,6 +865,6 @@ fn readme(ir: &Ir) -> String {
         }
     }
     out.push_str("\n## Honest status\n\n");
-    out.push_str("One shared Mutex-guarded SQLite connection is not a sized connection pool. Rate limiting is a process-local fixed window, not a distributed rate limit. R5+: TLS, authentication, real connection pool sizing, distributed rate limiting, HTTP keep-alive and streaming.\n");
+    out.push_str("One shared Mutex-guarded SQLite connection is not a sized connection pool. Rate limiting is a process-local fixed window, not a distributed rate limit. The bearer token is a development check, not a real auth provider. R6+: TLS, production identity, real connection pool sizing, distributed rate limiting, HTTP keep-alive, streaming, HTTP/2 and compression dictionaries.\n");
     out
 }

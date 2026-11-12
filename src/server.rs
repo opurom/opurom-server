@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use crate::http::{read_request, status_text, Request, Response, MAX_BODY_BYTES};
 use crate::middleware::{
-    rate_limited_response, request_log_line, structured_logging_enabled, MiddlewareChain,
-    RateLimiter,
+    apply_response_features, authorized, cors_preflight, rate_limited_response, request_log_line,
+    structured_logging_enabled, unauthorized_response, HttpOptions, MiddlewareChain, RateLimiter,
 };
 use crate::router::Router;
 
@@ -21,6 +21,7 @@ pub struct Server {
     router: Arc<Router>,
     middleware: Arc<MiddlewareChain>,
     limiter: Option<Arc<RateLimiter>>,
+    options: Arc<HttpOptions>,
     max_body: usize,
     shutdown: Arc<AtomicBool>,
 }
@@ -44,6 +45,7 @@ impl Server {
             router: Arc::new(router),
             middleware: Arc::new(middleware),
             limiter: RateLimiter::from_env().map(Arc::new),
+            options: Arc::new(HttpOptions::from_env()),
             max_body,
             shutdown: Arc::new(AtomicBool::new(false)),
         })
@@ -70,11 +72,12 @@ impl Server {
                     let router = Arc::clone(&self.router);
                     let middleware = Arc::clone(&self.middleware);
                     let limiter = self.limiter.clone();
+                    let options = Arc::clone(&self.options);
                     let max_body = self.max_body;
                     let shutdown = Arc::clone(&self.shutdown);
                     thread::spawn(move || {
                         let _ = handle_connection(
-                            stream, router, middleware, limiter, max_body, shutdown,
+                            stream, router, middleware, limiter, options, max_body, shutdown,
                         );
                     });
                 }
@@ -100,6 +103,7 @@ fn handle_connection(
     router: Arc<Router>,
     middleware: Arc<MiddlewareChain>,
     limiter: Option<Arc<RateLimiter>>,
+    options: Arc<HttpOptions>,
     max_body: usize,
     shutdown: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
@@ -111,13 +115,28 @@ fn handle_connection(
         Ok(mut request) => {
             let method = request.method.as_str().to_string();
             let path = request.path.clone();
-            let response = match middleware.apply(&mut request) {
+            let mut response = match middleware.apply(&mut request) {
                 Some(response) => response,
                 None => match limiter.as_ref().and_then(|limiter| limiter.check(&request)) {
                     Some(retry_after) => rate_limited_response(retry_after),
-                    None => router.handle(&mut request),
+                    None => {
+                        if let Some(preflight) =
+                            cors_preflight(&request, options.cors_origin.as_deref())
+                        {
+                            preflight
+                        } else if options
+                            .auth_token
+                            .as_deref()
+                            .is_some_and(|token| !authorized(&request, token))
+                        {
+                            unauthorized_response()
+                        } else {
+                            router.handle(&mut request)
+                        }
+                    }
                 },
             };
+            apply_response_features(&mut response, &request, options.as_ref());
             (response, method, path)
         }
         Err(err) => (

@@ -1,14 +1,18 @@
-//! Ordered middleware chain, request logging and fixed-window rate limiting.
+//! Ordered middleware chain, request logging, rate limiting and R5 HTTP options.
 //!
 //! A middleware is a boxed closure applied to every request before routing.
 //! Returning `Some(response)` short-circuits the request (for example the
-//! body-size cap); returning `None` lets the router handle it.
+//! body-size cap); returning `None` lets the router handle it. Auth, CORS,
+//! ETag and gzip are opt-in and are applied by `Server` around routing.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::http::{Request, Response, MAX_BODY_BYTES};
+use flate2::{write::GzEncoder, Compression};
+
+use crate::http::{Method, Request, Response, MAX_BODY_BYTES};
 
 /// Environment variable that enables structured JSON request logs.
 pub const STRUCTURED_LOG_ENV: &str = "OPR_LOG_JSON";
@@ -16,8 +20,20 @@ pub const STRUCTURED_LOG_ENV: &str = "OPR_LOG_JSON";
 /// Environment variable holding the per-route request limit per window.
 pub const RATE_LIMIT_ENV: &str = "OPR_RATE_LIMIT";
 
+/// Environment variable holding the optional development bearer token.
+pub const AUTH_TOKEN_ENV: &str = "OPR_AUTH_TOKEN";
+
+/// Environment variable holding one fixed CORS origin (or the literal `*`).
+pub const CORS_ENV: &str = "OPR_CORS";
+
+/// Environment variable that enables ETags by itself.
+pub const ETAG_ENV: &str = "OPR_ETAG";
+
 /// Length of one deterministic rate-limit window, in seconds.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+
+/// Response bodies larger than this many bytes may be gzip-compressed.
+pub const GZIP_THRESHOLD_BYTES: usize = 1024;
 
 /// One middleware layer.
 pub type Middleware = Box<dyn Fn(&mut Request) -> Option<Response> + Send + Sync>;
@@ -60,16 +76,21 @@ impl MiddlewareChain {
     }
 }
 
+fn truthy(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// True when an environment flag is set to a truthy value.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|raw| truthy(&raw))
+}
+
 /// True when `OPR_LOG_JSON` is set to a truthy value.
 pub fn structured_logging_enabled() -> bool {
-    std::env::var(STRUCTURED_LOG_ENV)
-        .map(|raw| {
-            matches!(
-                raw.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    env_flag(STRUCTURED_LOG_ENV)
 }
 
 /// One JSON object for a completed request. `elapsed_ms` is measured by the
@@ -121,7 +142,7 @@ pub fn default_body_cap() -> Middleware {
 /// after [`RATE_LIMIT_WINDOW_SECS`]. It is deterministic for a given `Instant`
 /// and is shared through a Mutex across server threads.
 // shortcut: keys use the received path, not the router pattern, and counters
-// are process-local; R5+ needs matched-pattern keys and a distributed store.
+// are process-local; R6+ needs matched-pattern keys and a distributed store.
 pub struct RateLimiter {
     limit: u64,
     start: Instant,
@@ -194,4 +215,223 @@ pub fn rate_limit(limit: u64) -> Middleware {
 /// Build the middleware layer described by `OPR_RATE_LIMIT`, when set.
 pub fn rate_limit_from_env() -> Option<Middleware> {
     RateLimiter::from_env().map(|limiter| rate_limit_with(Arc::new(limiter)))
+}
+
+/// R5 HTTP options captured once when a `Server` binds.
+#[derive(Clone, Debug, Default)]
+pub struct HttpOptions {
+    pub auth_token: Option<String>,
+    pub cors_origin: Option<String>,
+    pub etag: bool,
+}
+
+impl HttpOptions {
+    /// Read R5 options from the environment. Any R5 opt-in variable enables
+    /// ETags; `OPR_ETAG` can also enable or explicitly disable them alone.
+    pub fn from_env() -> HttpOptions {
+        let auth_token = std::env::var(AUTH_TOKEN_ENV)
+            .ok()
+            .filter(|token| !token.is_empty());
+        let cors_origin = std::env::var(CORS_ENV)
+            .ok()
+            .and_then(|raw| cors_origin_from_env_value(&raw));
+        let etag = match std::env::var(ETAG_ENV) {
+            Ok(raw) => truthy(&raw),
+            Err(_) => auth_token.is_some() || cors_origin.is_some(),
+        };
+        HttpOptions {
+            auth_token,
+            cors_origin,
+            etag,
+        }
+    }
+}
+
+/// Compare bytes without an early exit on the first differing byte.
+// shortcut: length remains visible in timing; R6+ needs a production identity provider.
+pub fn constant_time_eq(expected: &[u8], provided: &[u8]) -> bool {
+    let mut difference = expected.len() ^ provided.len();
+    for index in 0..expected.len().max(provided.len()) {
+        let left = expected.get(index).copied().unwrap_or(0);
+        let right = provided.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left ^ right);
+    }
+    difference == 0
+}
+
+/// Check the development bearer token. This is not a production identity
+/// system: there are no users, scopes, expiry, hashing or credential storage.
+pub fn authorized(request: &Request, token: &str) -> bool {
+    request
+        .header("Authorization")
+        .and_then(|raw| raw.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+        .is_some_and(|(_, candidate)| constant_time_eq(candidate.as_bytes(), token.as_bytes()))
+}
+
+/// Canonical 401 response for a missing or mismatched bearer token.
+pub fn unauthorized_response() -> Response {
+    Response::error(401, "unauthorized")
+}
+
+/// Validate one operator-configured CORS origin. The value is emitted verbatim;
+/// the request's `Origin` header is never used to build a response header.
+pub fn cors_origin_from_env_value(raw: &str) -> Option<String> {
+    let origin = raw.trim().to_ascii_lowercase();
+    if origin == "*" {
+        return Some(origin);
+    }
+    let host = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))?;
+    if host.is_empty()
+        || !host.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':' | b'[' | b']')
+        })
+    {
+        return None;
+    }
+    Some(origin)
+}
+
+/// A fixed-allow-list CORS preflight response. Preflight bypasses auth but is
+/// still rate limited and logged by `Server`.
+pub fn cors_preflight(request: &Request, origin: Option<&str>) -> Option<Response> {
+    let origin = origin?;
+    if request.method.as_str() != "OPTIONS" {
+        return None;
+    }
+    Some(
+        Response::new(204)
+            .with_header("Access-Control-Allow-Origin", origin)
+            .with_header(
+                "Access-Control-Allow-Methods",
+                "GET, POST, PUT, DELETE, OPTIONS",
+            )
+            .with_header(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type",
+            )
+            .with_header("Vary", "Origin"),
+    )
+}
+
+fn has_header(response: &Response, name: &str) -> bool {
+    response
+        .headers
+        .iter()
+        .any(|(key, _)| key.eq_ignore_ascii_case(name))
+}
+
+fn add_vary(response: &mut Response, value: &str) {
+    if let Some((_, current)) = response
+        .headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("Vary"))
+    {
+        if !current
+            .split(',')
+            .any(|field| field.trim().eq_ignore_ascii_case(value))
+        {
+            current.push_str(", ");
+            current.push_str(value);
+        }
+    } else {
+        response.set_header("Vary", value);
+    }
+}
+
+/// Deterministic, non-cryptographic FNV-1a validator for an uncompressed body.
+pub fn etag_for(body: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in body {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("\"{hash:016x}\"")
+}
+
+/// Weak/list comparison for `If-None-Match` on GET requests.
+pub fn if_none_match_matches(raw: &str, etag: &str) -> bool {
+    raw.split(',').any(|entry| {
+        let candidate = entry.trim();
+        let strong = candidate
+            .strip_prefix("W/")
+            .or_else(|| candidate.strip_prefix("w/"))
+            .unwrap_or(candidate)
+            .trim();
+        candidate == "*" || strong == etag
+    })
+}
+
+/// True when `Accept-Encoding` offers gzip with a nonzero quality.
+pub fn accepts_gzip(request: &Request) -> bool {
+    request.header("Accept-Encoding").is_some_and(|raw| {
+        raw.split(',').any(|entry| {
+            let mut fields = entry.trim().split(';');
+            let coding = fields.next().unwrap_or_default().trim();
+            if !coding.eq_ignore_ascii_case("gzip") {
+                return false;
+            }
+            !fields.any(|parameter| {
+                let Some((name, value)) = parameter.trim().split_once('=') else {
+                    return false;
+                };
+                name.trim().eq_ignore_ascii_case("q") && value.trim().parse::<f32>() == Ok(0.0)
+            })
+        })
+    })
+}
+
+/// Compress one response body into a complete gzip member.
+pub fn gzip_body(body: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body)?;
+    encoder.finish()
+}
+
+/// Apply the opt-in R5 response features to a completed response.
+pub fn apply_response_features(response: &mut Response, request: &Request, options: &HttpOptions) {
+    if let Some(origin) = options.cors_origin.as_deref() {
+        if !has_header(response, "Access-Control-Allow-Origin") {
+            response.set_header("Access-Control-Allow-Origin", origin);
+        }
+        add_vary(response, "Origin");
+    }
+
+    if options.etag
+        && (200..300).contains(&response.status)
+        && !response.body.is_empty()
+        && !has_header(response, "ETag")
+    {
+        let etag = etag_for(&response.body);
+        response.set_header("ETag", &etag);
+        if request.method == Method::Get
+            && request
+                .header("If-None-Match")
+                .is_some_and(|raw| if_none_match_matches(raw, &etag))
+        {
+            response.status = 304;
+            response.body.clear();
+            response.headers.retain(|(name, _)| {
+                name.eq_ignore_ascii_case("ETag")
+                    || name.eq_ignore_ascii_case("Vary")
+                    || name
+                        .get(.."Access-Control-".len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Access-Control-"))
+            });
+            return;
+        }
+    }
+
+    if accepts_gzip(request)
+        && response.body.len() > GZIP_THRESHOLD_BYTES
+        && !has_header(response, "Content-Encoding")
+    {
+        if let Ok(compressed) = gzip_body(&response.body) {
+            response.body = compressed;
+            response.set_header("Content-Encoding", "gzip");
+            add_vary(response, "Accept-Encoding");
+        }
+    }
 }
