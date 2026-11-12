@@ -1,0 +1,13 @@
+{
+  "project": "opurom-server",
+  "organization": "opurom",
+  "checks": [
+    "english",
+    "docs",
+    "rust-test",
+    "rust-fmt",
+    "node-test",
+    "node-syntax",
+    "validate"
+  ]
+}

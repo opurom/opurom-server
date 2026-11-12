@@ -1,0 +1,62 @@
+name: Release
+
+# Tags and releases are produced only after CI succeeds on main. CI fans out
+# its checks into parallel jobs; this workflow counts the version, pushes a
+# lightweight tag pointing at the exact verified commit, then publishes the
+# release notes. Local developers only push code.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  version-and-release:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Compute next version tag
+        id: version
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          HEAD_SHA=$(git rev-parse HEAD)
+          EXISTING=$(git tag --points-at "$HEAD_SHA" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]{4}$' | head -1 || true)
+          if [ -n "$EXISTING" ]; then
+            echo "tag=$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "preexisting=true" >> "$GITHUB_OUTPUT"
+          else
+            TAG=$(git tag --list 'v*' | node .github/scripts/next-version.mjs)
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "preexisting=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push lightweight tag
+        if: ${{ steps.version.outputs.preexisting != 'true' }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.version.outputs.tag }}" "${{ github.event.workflow_run.head_sha || github.sha }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ github.event.repository.name }} ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          prerelease: false
