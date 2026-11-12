@@ -6,9 +6,13 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use crate::http::{read_request, status_text, Request, Response, MAX_BODY_BYTES};
-use crate::middleware::MiddlewareChain;
+use crate::middleware::{
+    rate_limited_response, request_log_line, structured_logging_enabled, MiddlewareChain,
+    RateLimiter,
+};
 use crate::router::Router;
 
 /// A running HTTP server.
@@ -16,6 +20,7 @@ pub struct Server {
     listener: TcpListener,
     router: Arc<Router>,
     middleware: Arc<MiddlewareChain>,
+    limiter: Option<Arc<RateLimiter>>,
     max_body: usize,
     shutdown: Arc<AtomicBool>,
 }
@@ -38,6 +43,7 @@ impl Server {
             listener,
             router: Arc::new(router),
             middleware: Arc::new(middleware),
+            limiter: RateLimiter::from_env().map(Arc::new),
             max_body,
             shutdown: Arc::new(AtomicBool::new(false)),
         })
@@ -63,10 +69,13 @@ impl Server {
                 Ok(stream) => {
                     let router = Arc::clone(&self.router);
                     let middleware = Arc::clone(&self.middleware);
+                    let limiter = self.limiter.clone();
                     let max_body = self.max_body;
                     let shutdown = Arc::clone(&self.shutdown);
                     thread::spawn(move || {
-                        let _ = handle_connection(stream, router, middleware, max_body, shutdown);
+                        let _ = handle_connection(
+                            stream, router, middleware, limiter, max_body, shutdown,
+                        );
                     });
                 }
                 Err(err) => eprintln!("[opurom-server] accept failed: {}", err),
@@ -90,20 +99,42 @@ fn handle_connection(
     stream: TcpStream,
     router: Arc<Router>,
     middleware: Arc<MiddlewareChain>,
+    limiter: Option<Arc<RateLimiter>>,
     max_body: usize,
     shutdown: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let _ = shutdown;
+    let started = Instant::now();
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
-    let response = match read_request(&mut reader, max_body) {
-        Ok(mut request) => match middleware.apply(&mut request) {
-            Some(response) => response,
-            None => router.handle(&mut request),
-        },
-        Err(err) => Response::error(err.status, &err.message),
+    let (response, method, path) = match read_request(&mut reader, max_body) {
+        Ok(mut request) => {
+            let method = request.method.as_str().to_string();
+            let path = request.path.clone();
+            let response = match middleware.apply(&mut request) {
+                Some(response) => response,
+                None => match limiter.as_ref().and_then(|limiter| limiter.check(&request)) {
+                    Some(retry_after) => rate_limited_response(retry_after),
+                    None => router.handle(&mut request),
+                },
+            };
+            (response, method, path)
+        }
+        Err(err) => (
+            Response::error(err.status, &err.message),
+            "-".to_string(),
+            "-".to_string(),
+        ),
     };
-    write_response(&mut writer, &response)
+    let result = write_response(&mut writer, &response);
+    if structured_logging_enabled() {
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        eprintln!(
+            "{}",
+            request_log_line(&method, &path, response.status, elapsed_ms)
+        );
+    }
+    result
 }
 
 /// Write the response and close the connection (no keep-alive in R2).

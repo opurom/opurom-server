@@ -151,3 +151,22 @@ fn lowering_rejects_a_bad_ir() {
     assert!(error.contains("0.1"), "{}", error);
     let _ = fs::remove_dir_all(&out);
 }
+
+#[test]
+fn lowering_shares_one_pooled_database() {
+    let out = temp_dir("pooled");
+    lower_service(IR, &out, &PathBuf::from("/tmp/dep-root")).expect("lowering works");
+    let main = fs::read_to_string(out.join("src/main.rs")).expect("main.rs exists");
+    let readme = fs::read_to_string(out.join("README.md")).expect("README.md exists");
+
+    assert!(main.contains("PooledDb::open(&db_path)"), "{}", main);
+    assert_eq!(main.matches("PooledDb::open(&db_path)").count(), 1);
+    assert_eq!(main.matches(".with(|guard| {").count(), 5, "{}", main);
+    assert!(!main.contains("Sqlite::open(&"), "{}", main);
+    assert!(!main.contains("Arc<String>"), "{}", main);
+    assert!(!main.contains("Arc::clone"), "{}", main);
+    assert!(readme.contains("OPR_RATE_LIMIT"), "{}", readme);
+    assert!(readme.contains("OPR_LOG_JSON"), "{}", readme);
+    assert!(readme.contains("not a sized connection pool"), "{}", readme);
+    let _ = fs::remove_dir_all(&out);
+}

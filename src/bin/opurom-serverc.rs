@@ -1,4 +1,4 @@
-//! `opurom-serverc` — lower a full-stack IR into a standalone Rust service.
+//! `opurom-serverc` - lower a full-stack IR into a standalone Rust service.
 //!
 //! Usage:
 //!   opurom-serverc <fullstack-ir.json> -o <dir> [--dep-root <path>]

@@ -1,4 +1,4 @@
-//! The `opurom-serverc` lowering pass: full-stack IR → standalone Rust crate.
+//! The `opurom-serverc` lowering pass: full-stack IR -> standalone Rust crate.
 //!
 //! The generated crate is straight-line lowered Rust: the router, the five CRUD
 //! handlers, `/health` and `/ssr` are emitted as ordinary Rust code. No IR
@@ -149,8 +149,8 @@ fn main_rs(ir: &Ir) -> String {
     let mut out = String::new();
     out.push_str(HEADER);
     out.push_str(
-        "\nuse std::sync::Arc;\n\n\
-         use opurom_db::{Database, Row, Sqlite, Value as DbValue};\n\
+        "\n\
+         use opurom_db::{Database, PooledDb, Row, Sqlite, Value as DbValue};\n\
          use opurom_server::http::{Method, Request, Response};\n\
          use opurom_server::middleware::{body_cap, logging, MiddlewareChain};\n\
          use opurom_server::router::Router;\n\
@@ -326,7 +326,8 @@ fn next_id(db: &mut Sqlite, table: &str, primary: &str) -> DbValue {
 "#;
 
 /// Router construction.
-const ROUTER_BUILD: &str = r#"fn build_router(db_path: Arc<String>) -> Router {
+const ROUTER_BUILD: &str = r#"#[allow(unused_variables)]
+fn build_router(db: PooledDb) -> Router {
     let mut router = Router::new();
     router.route(Method::Get, "/health", |_request: &mut Request| {
         Response::json_text(
@@ -359,21 +360,25 @@ fn main() {
         }
     }
 
-    let mut db = match Sqlite::open(&db_path) {
-        Ok(db) => db,
+    let pool = match PooledDb::open(&db_path) {
+        Ok(pool) => pool,
         Err(err) => {
             eprintln!("[opurom-service] cannot open {}: {}", db_path, err);
             std::process::exit(1);
         }
     };
-    for (name, sql) in MIGRATIONS {
-        if let Err(err) = db.exec(sql) {
-            eprintln!("[opurom-service] migration {} failed: {}", name, err);
-            std::process::exit(1);
+    if let Err(err) = pool.with(|db| -> Result<(), String> {
+        for (name, sql) in MIGRATIONS {
+            if let Err(err) = db.exec(sql) {
+                return Err(format!("migration {} failed: {}", name, err));
+            }
         }
+        Ok(())
+    }) {
+        eprintln!("[opurom-service] {}", err);
+        std::process::exit(1);
     }
-    let db_path = Arc::new(db_path);
-    let mut router = build_router(db_path);
+    let mut router = build_router(pool);
     router.route(Method::Get, "/ssr", |_request: &mut Request| {
         Response::html(200, &ssr_html(IR_JSON, ""))
     });
@@ -395,25 +400,20 @@ fn main() {
 "#;
 
 /// Handler templates, one per CRUD verb.
-const LIST_HANDLER: &str = r#"    let list_db = Arc::clone(&db_path);
+const LIST_HANDLER: &str = r#"    let list_db = db.clone();
     router.route(Method::Get, "{{PATH}}", move |_request: &mut Request| {
-        let mut guard = match Sqlite::open(&list_db) {
-            Ok(db) => db,
-            Err(err) => return Response::error(500, &format!("database_error: {}", err)),
-        };
+        list_db.with(|guard| {
         match guard.query("{{SQL}}") {
             Ok(rows) => Response::json_text(200, &rows_to_json({{MODEL}}, &rows)),
             Err(err) => Response::error(500, &format!("database_error: {}", err)),
         }
+        })
     });
 "#;
 
-const GET_HANDLER: &str = r#"    let get_db = Arc::clone(&db_path);
+const GET_HANDLER: &str = r#"    let get_db = db.clone();
     router.route(Method::Get, "{{PATH}}", move |request: &mut Request| {
-        let mut guard = match Sqlite::open(&get_db) {
-            Ok(db) => db,
-            Err(err) => return Response::error(500, &format!("database_error: {}", err)),
-        };
+        get_db.with(|guard| {
         let raw_id = request.param("{{PARAM}}").unwrap_or_default().to_string();
         let id_value = match parse_id(&raw_id) {
             Some(value) => value,
@@ -426,15 +426,13 @@ const GET_HANDLER: &str = r#"    let get_db = Arc::clone(&db_path);
             },
             Err(err) => Response::error(500, &format!("database_error: {}", err)),
         }
+        })
     });
 "#;
 
-const CREATE_HANDLER: &str = r#"    let create_db = Arc::clone(&db_path);
+const CREATE_HANDLER: &str = r#"    let create_db = db.clone();
     router.route(Method::Post, "{{PATH}}", move |request: &mut Request| {
-        let mut guard = match Sqlite::open(&create_db) {
-            Ok(db) => db,
-            Err(err) => return Response::error(500, &format!("database_error: {}", err)),
-        };
+        create_db.with(|guard| {
         let body = match request.json() {
             Ok(value) => value,
             Err(_) => return Response::error(400, "invalid_json"),
@@ -458,15 +456,13 @@ const CREATE_HANDLER: &str = r#"    let create_db = Arc::clone(&db_path);
             },
             Err(err) => Response::error(500, &format!("database_error: {}", err)),
         }
+        })
     });
 "#;
 
-const UPDATE_HANDLER: &str = r#"    let update_db = Arc::clone(&db_path);
+const UPDATE_HANDLER: &str = r#"    let update_db = db.clone();
     router.route(Method::Put, "{{PATH}}", move |request: &mut Request| {
-        let mut guard = match Sqlite::open(&update_db) {
-            Ok(db) => db,
-            Err(err) => return Response::error(500, &format!("database_error: {}", err)),
-        };
+        update_db.with(|guard| {
         let raw_id = request.param("{{PARAM}}").unwrap_or_default().to_string();
         let id_value = match parse_id(&raw_id) {
             Some(value) => value,
@@ -497,15 +493,13 @@ const UPDATE_HANDLER: &str = r#"    let update_db = Arc::clone(&db_path);
             },
             Err(err) => Response::error(500, &format!("database_error: {}", err)),
         }
+        })
     });
 "#;
 
-const DELETE_HANDLER: &str = r#"    let delete_db = Arc::clone(&db_path);
+const DELETE_HANDLER: &str = r#"    let delete_db = db.clone();
     router.route(Method::Delete, "{{PATH}}", move |request: &mut Request| {
-        let mut guard = match Sqlite::open(&delete_db) {
-            Ok(db) => db,
-            Err(err) => return Response::error(500, &format!("database_error: {}", err)),
-        };
+        delete_db.with(|guard| {
         let raw_id = request.param("{{PARAM}}").unwrap_or_default().to_string();
         let id_value = match parse_id(&raw_id) {
             Some(value) => value,
@@ -523,6 +517,7 @@ const DELETE_HANDLER: &str = r#"    let delete_db = Arc::clone(&db_path);
             }
             Err(err) => Response::error(500, &format!("database_error: {}", err)),
         }
+        })
     });
 "#;
 
@@ -614,9 +609,9 @@ fn create_columns(model: &Model) -> String {
                 "            values.push(match FieldType::{} {{",
                 field_type_variant(&field.ty)
             );
-            out.push_str("                FieldType::Int => Value::Int(0),\n");
-            out.push_str("                FieldType::Text => Value::Text(String::new()),\n");
-            out.push_str("                FieldType::Bool => Value::Bool(false),\n");
+            out.push_str("                FieldType::Int => DbValue::Int(0),\n");
+            out.push_str("                FieldType::Text => DbValue::Text(String::new()),\n");
+            out.push_str("                FieldType::Bool => DbValue::Bool(false),\n");
             out.push_str("            });\n");
             out.push_str("        }\n");
         }
@@ -659,7 +654,7 @@ fn id_value_stmt(model: &Model) -> String {
     };
     match primary.ty {
         FieldType::Int => format!(
-            "        let id_value = match object.get({:?}) {{\n            Some(raw) => db_value(raw),\n            None => next_id(&mut guard, {:?}, {:?}),\n        }};\n",
+            "        let id_value = match object.get({:?}) {{\n            Some(raw) => db_value(raw),\n            None => next_id(guard, {:?}, {:?}),\n        }};\n",
             primary.name,
             model.table(),
             primary.name
@@ -838,12 +833,15 @@ fn readme(ir: &Ir) -> String {
     );
     out.push_str("## Run\n\n```sh\ncargo run --release\n```\n\n");
     out.push_str("Environment:\n\n");
-    out.push_str("* `OPR_PORT` — listen port (default `8787`)\n");
-    out.push_str("* `OPR_DB` — SQLite database path (default `./opurom.db`)\n\n");
+    out.push_str("* `OPR_PORT` - listen port (default `8787`)\n");
+    out.push_str("* `OPR_DB` - SQLite database path (default `./opurom.db`)\n");
+    out.push_str("* `OPR_RATE_LIMIT` - optional positive integer requests per method and path per 60-second window; excess requests get `429` JSON and `Retry-After` seconds\n");
+    out.push_str("* `OPR_LOG_JSON=1` - one JSON line per request to stderr with `method`, `path`, `status` and measured `elapsed_ms`; replaces the plain log line\n\n");
+    out.push_str("The service opens one `PooledDb` at startup and shares its Mutex-serialized SQLite connection across all handlers. With no optional hardening env vars set, HTTP responses and stdout stay unchanged.\n\n");
     out.push_str("The schema is created at startup from the embedded `migrations/*.sql`.\n\n");
     out.push_str("## Routes\n\n");
-    out.push_str("* `GET /health` — `{\"ok\":true,\"app\":\"...\",\"version\":\"0.2.0\"}`\n");
-    out.push_str("* `GET /ssr` — server-rendered HTML of the IR tree\n");
+    out.push_str("* `GET /health` - `{\"ok\":true,\"app\":\"...\",\"version\":\"0.2.0\"}`\n");
+    out.push_str("* `GET /ssr` - server-rendered HTML of the IR tree\n");
     for api in &ir.api {
         for verb in &api.handlers {
             let method = match verb.as_str() {
@@ -862,5 +860,7 @@ fn readme(ir: &Ir) -> String {
             let _ = writeln!(out, "* `{} {}{}`", method, api.path, suffix);
         }
     }
+    out.push_str("\n## Honest status\n\n");
+    out.push_str("One shared Mutex-guarded SQLite connection is not a sized connection pool. Rate limiting is a process-local fixed window, not a distributed rate limit. R5+: TLS, authentication, real connection pool sizing, distributed rate limiting, HTTP keep-alive and streaming.\n");
     out
 }

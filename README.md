@@ -1,50 +1,42 @@
 # opurom-server
 
-OPUROM R2 backend runtime: a std-only HTTP/1.1 server, a router with path
-parameters, per-route fault isolation, a deterministic SSR host, and
+OPUROM R2/R4 backend runtime: a std-only HTTP/1.1 server, a router with path
+parameters, per-route fault isolation, a deterministic SSR host, R4 hardening
+(pooled SQLite, fixed-window rate limiting, structured logs), and
 `opurom-serverc`, the compiler that lowers a full-stack IR into a standalone
 Rust service crate.
 
 This crate implements the backend half of
-[`FULLSTACK_SPEC.md`](../opurom-spec/FULLSTACK_SPEC.md) §4–§5.
+[`FULLSTACK_SPEC.md`](../opurom-spec/FULLSTACK_SPEC.md) sections 4-5 and
+[`R4_ADDENDUM.md`](../opurom-spec/R4_ADDENDUM.md) section 6.
 
 ## Architecture
 
 ```
-                     ┌──────────────────────────────────────────┐
-  TCP connection ──▶ │ http::read_request                        │
-                     │  request line + headers + Content-Length  │
-                     │  body cap 1 MiB → 413                    │
-                     └───────────────────┬──────────────────────┘
-                                         ▼
-                     ┌──────────────────────────────────────────┐
-                     │ middleware::MiddlewareChain               │
-                     │  Vec<Box<dyn Fn(&mut Request) -> Option  │
-                     │        <Response> + Send + Sync>>         │
-                     │  applied in order; first answer wins     │
-                     └───────────────────┬──────────────────────┘
-                                         ▼
-                     ┌──────────────────────────────────────────┐
-                     │ router::Router                           │
-                     │  literal + :param segments               │
-                     │  404 unknown · 405 wrong method           │
-                     │  catch_unwind per handler                │
-                     │  3 consecutive panics → route disabled   │
-                     └───────────────────┬──────────────────────┘
-                                         ▼
-                     ┌──────────────────────────────────────────┐
-                     │ handler                                  │
-                     │  generated CRUD code (opurom-db)         │
-                     │  SSR render (ssr::ssr_html)               │
-                     └──────────────────────────────────────────┘
+TCP connection -> http::read_request
+                  request line + headers + Content-Length
+                  body cap 1 MiB -> 413
+               -> middleware::MiddlewareChain
+                  logging (plain by default) + body cap
+               -> server::Server optional OPR_RATE_LIMIT check
+                  429 JSON + Retry-After
+               -> router::Router
+                  literal + :param segments
+                  404 unknown / 405 wrong method
+                  catch_unwind per handler
+                  3 consecutive panics -> route disabled
+               -> handler
+                  generated CRUD code (opurom-db PooledDb)
+                  SSR render (ssr::ssr_html)
+               -> server::Server optional OPR_LOG_JSON line to stderr
 ```
 
 | Module | Responsibility |
 | --- | --- |
 | `http` | `Method`, `Request`, `Response`, the bounded request parser, status text |
-| `middleware` | `MiddlewareChain`: an ordered `Vec` of boxed closures |
+| `middleware` | `MiddlewareChain`, `RateLimiter`, logging helpers, body cap |
 | `router` | route table, `:param` matching, panic isolation, 3-strike breaker |
-| `server` | `TcpListener` accept loop, one thread per connection, `Connection: close` |
+| `server` | `TcpListener` accept loop, one thread per connection, `Connection: close`, optional limiter and measured JSON log |
 | `ssr` | deterministic HTML rendering of the IR tree with theme tokens |
 | `ir` | IR v0.1 model: state, tree, theme, models, api |
 | `codegen` | the `opurom-serverc` lowering pass |
@@ -72,10 +64,52 @@ handler is caught, and no failure path aborts the process.
 | Unknown path | 404 | `{"error":"not_found"}` |
 | Wrong method | 405 | `{"error":"method_not_allowed"}` |
 | Body over 1 MiB | 413 | `{"error":"payload_too_large"}` |
+| Rate limit exceeded | 429 | `{"error":"rate_limited"}` plus `Retry-After` seconds |
 | Handler panic | 500 | `{"error":"handler_panic"}` |
 | Route disabled after 3 panics | 503 | `{"error":"route_disabled"}` |
 
 Row objects use the model field names exactly; a `bool` field is a JSON boolean.
+
+## R4 hardening
+
+All R4 hardening is opt-in-compatible. With no `OPR_RATE_LIMIT` and no
+`OPR_LOG_JSON`, HTTP responses, stdout, and the existing plain stderr log
+remain byte-identical. There is no 429 and no JSON log line by default.
+
+### Shared SQLite handle
+
+The generated service opens one `opurom_db::PooledDb` at startup and shares it
+across every CRUD handler with `PooledDb::with`. `PooledDb` is
+`Arc<Mutex<Sqlite>>`; `Sqlite::open` verifies `sqlite3_threadsafe()`, and every
+FFI call holds the Mutex for the whole `&mut Sqlite` borrow. `opurom-db`
+provides justified `unsafe impl Send` and `unsafe impl Sync` for `PooledDb`
+under that invariant. `Sqlite` itself remains not `Send`.
+
+This is one shared connection, not a sized pool of independent connections.
+
+### Rate limiting
+
+Set `OPR_RATE_LIMIT` to a positive integer N. `Server` installs a deterministic
+per-method-and-path fixed-window counter with a 60-second window. The first N
+requests in a window are allowed; request N+1 gets `429` JSON and a
+`Retry-After` header containing the seconds remaining until the window resets.
+Invalid or non-positive values disable rate limiting. The counter is protected
+by a Mutex and shared across server threads, but it is process-local: there is
+no distributed rate limit.
+
+### Structured request logging
+
+Set `OPR_LOG_JSON=1` (also `true`, `yes`, or `on`). After each response, the
+server writes exactly one JSON line to stderr with `method`, `path`, `status`
+and `elapsed_ms`. `elapsed_ms` is measured with `std::time::Instant` from the
+start of connection handling through the socket write. The plain
+`[opurom-server] -> METHOD PATH` middleware line is suppressed in this mode, so
+there is still one request log line per request. Stdout is never used for
+request logs. A measured sample from the R4 smoke run:
+
+```json
+{"elapsed_ms":0,"method":"GET","path":"/health","status":200}
+```
 
 ## Generated service (`opurom-serverc`)
 
@@ -100,10 +134,11 @@ The generator writes a standalone crate into `<dir>`:
   IR is embedded as a string only for the `/ssr` route.
 * The generated crate reads `OPR_PORT` (default `8787`) and `OPR_DB`
   (default `./opurom.db`). The parent directory of `OPR_DB` is created if
-  missing.
-* The schema is created at startup: every `migrations/*.sql` statement is
-  embedded with `include_str!` and executed (they are `CREATE TABLE IF NOT
-  EXISTS`, so startup is idempotent).
+  missing. It also honours `OPR_RATE_LIMIT` and `OPR_LOG_JSON` through the
+  runtime described above.
+* The schema is created at startup inside one `PooledDb::with` call: every
+  `migrations/*.sql` statement is embedded with `include_str!` and executed
+  (they are `CREATE TABLE IF NOT EXISTS`, so startup is idempotent).
 
 Build and run the generated service:
 
@@ -112,9 +147,9 @@ cargo build --release --manifest-path <dir>/Cargo.toml
 OPR_PORT=8787 OPR_DB=./opurom.db <dir>/target/release/opurom-service
 ```
 
-Because `opurom-db`'s SQLite handle holds a raw pointer, it is not `Send`; the
-generated service therefore opens one connection per request. There is no
-connection pooling in R2.
+The generated service no longer opens one connection per request. It shares
+the one Mutex-serialized connection from `PooledDb`; real connection pool
+sizing remains R5+.
 
 ## Demo server
 
@@ -123,25 +158,29 @@ cargo run --bin opurom-server -- 8787      # or: OPR_PORT=8787 cargo run --bin o
 ```
 
 The demo serves `/health`, `/ssr` and an in-memory `/todos` collection with the
-five CRUD verbs.
+five CRUD verbs. It uses the same optional rate limiter and structured logging
+as generated services.
 
 ## Tests
 
 ```sh
-cargo fmt
-cargo test
+cargo fmt --all
+cargo test --offline
 ```
 
-The suite starts a real server on an ephemeral port and drives it over TCP:
+The 24 tests include a real server on an ephemeral port driven over TCP:
 
 | Test file | Covers |
 | --- | --- |
-| `tests/http_server.rs` | health, the full CRUD lifecycle, 404, 405, 413, the 1 MiB boundary, panic → 500 → 503 with other routes still serving, `:param` matching |
-| `tests/ssr.rs` | byte-identical output for the same IR and theme, theme changes the output, state interpolation, kind → HTML element mapping, IR version validation |
-| `tests/codegen.rs` | the generated crate shape, the migration SQL, deterministic lowering, IR validation |
+| `tests/http_server.rs` | health, the full CRUD lifecycle, 404, 405, 413, the 1 MiB boundary, panic -> 500 -> 503 with other routes still serving, `:param` matching |
+| `tests/ssr.rs` | byte-identical output for the same IR and theme, theme changes the output, state interpolation, kind -> HTML element mapping, IR version validation |
+| `tests/codegen.rs` | generated crate shape, migration SQL, deterministic lowering, IR validation, one shared `PooledDb` in generated code |
+| `tests/hardening.rs` | deterministic N/N+1 rate-limit boundary and window reset, `OPR_RATE_LIMIT` over TCP, JSON log shape with numeric measured `elapsed_ms`, one JSON stderr line per request, byte-identical default responses |
 
-The tests are self-contained: they use an in-process store, not `opurom-db`, so
-`cargo test` passes in this repository on its own.
+The in-process tests are self-contained: they use an in-memory store, not
+`opurom-db`, so `cargo test` passes in this repository on its own. The
+generated-service CRUD path is compiled and smoke-tested separately against
+the sibling `opurom-db` crate.
 
 ## Status
 
@@ -152,20 +191,24 @@ Implemented and verified in this repository:
 | HTTP/1.1 routing (literal + `:param`) | Implemented, tested |
 | Five CRUD verbs via the generated service | Implemented, verified end to end against `opurom-db` |
 | SQLite-backed storage (via `opurom-db`) | Implemented through the sibling crate |
+| One shared Mutex-serialized SQLite handle | Implemented in generated services, tested in `opurom-db` and smoke-tested |
 | SSR HTML from the same IR | Implemented, deterministic, tested |
-| Fault isolation (panic → 500, 3 strikes → 503) | Implemented, tested |
-| Middleware chain | Implemented (logging, body cap); no CORS layer by default |
+| Fault isolation (panic -> 500, 3 strikes -> 503) | Implemented, tested |
+| Middleware chain | Implemented (plain logging by default, body cap) |
+| Fixed-window rate limiting | Implemented, opt-in via `OPR_RATE_LIMIT`, process-local |
+| Structured request logging | Implemented, opt-in via `OPR_LOG_JSON`, measured `elapsed_ms` |
 | `opurom-serverc` lowering to a standalone crate | Implemented, tested |
 
-Not implemented (R3+):
+Not implemented (R5+):
 
 | Area | Status |
 | --- | --- |
 | TLS | Not implemented |
 | Authentication / authorization | Not implemented |
-| Connection pooling | Not implemented (one connection per request) |
+| Real connection pool sizing | Not implemented (one shared Mutex-guarded connection only) |
+| Distributed rate limiting | Not implemented (in-process counters only) |
 | PostgreSQL / MySQL drivers | Not implemented (SQLite and the `opurom-db` KV/Memory drivers only) |
 | Node.js / Serverless deployment | Not implemented |
-| Full middleware ecosystem (CORS, compression, rate limiting) | Not implemented |
+| CORS, compression and other middleware | Not implemented |
 | Real device benchmarks | Not implemented; no fabricated numbers |
 | HTTP keep-alive, chunked bodies, streaming | Not implemented (R2 closes every connection) |

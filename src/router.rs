@@ -136,10 +136,10 @@ impl Router {
 
     /// Route a request.
     ///
-    /// * unknown path → `404` JSON
-    /// * known path, wrong method → `405` JSON
-    /// * disabled route → `503` JSON
-    /// * panicking handler → `500` JSON, route disabled after three strikes
+    /// * unknown path -> `404` JSON
+    /// * known path, wrong method -> `405` JSON
+    /// * disabled route -> `503` JSON
+    /// * panicking handler -> `500` JSON, route disabled after three strikes
     pub fn handle(&self, request: &mut Request) -> Response {
         let mut path_matched = false;
         for route in &self.routes {
