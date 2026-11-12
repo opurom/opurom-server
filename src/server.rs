@@ -7,6 +7,11 @@
 //! * `OPR_KEEPALIVE=1` reuses a connection for several HTTP/1.1 requests.
 //! * `OPR_WEBSOCKET=1` accepts RFC 6455 upgrades.
 //!
+//! R8 adds opt-in `OPR_MTLS=1` client certificates, the `OPR_REVOKED` static
+//! fingerprint deny list and ALPN reporting. With none of the R8 variables
+//! set and no client ALPN offer, the R7 wire format and response bytes stay
+//! identical.
+//!
 //! Connections are bounded by an idle timeout and a maximum number of
 //! in-flight connections.
 
@@ -24,7 +29,8 @@ use rustls::StreamOwned;
 use crate::http::{read_request, status_text, Request, Response, MAX_BODY_BYTES};
 use crate::middleware::{
     apply_response_features, authorized, cors_preflight, rate_limited_response, request_log_line,
-    structured_logging_enabled, unauthorized_response, HttpOptions, MiddlewareChain, RateLimiter,
+    structured_logging_enabled, tls_request_log_line, unauthorized_response, HttpOptions,
+    MiddlewareChain, RateLimiter,
 };
 use crate::router::Router;
 use crate::tls::{self, TlsConfig};
@@ -304,6 +310,27 @@ impl Write for Transport {
 }
 
 impl Transport {
+    /// The ALPN protocol rustls selected during the handshake, if any.
+    fn alpn_protocol(&self) -> Option<String> {
+        match self {
+            Transport::Plain(_) => None,
+            Transport::Tls(Some(stream)) => stream
+                .conn
+                .alpn_protocol()
+                .map(|protocol| String::from_utf8_lossy(protocol).into_owned()),
+            Transport::Tls(None) => None,
+        }
+    }
+
+    /// True while a TLS handshake is still in progress.
+    fn is_handshaking(&self) -> bool {
+        match self {
+            Transport::Plain(_) => false,
+            Transport::Tls(Some(stream)) => stream.conn.is_handshaking(),
+            Transport::Tls(None) => false,
+        }
+    }
+
     /// Close the connection. A TLS connection sends `close_notify` first so
     /// the peer sees a clean shutdown instead of a truncated stream.
     fn shutdown(&mut self) -> std::io::Result<()> {
@@ -348,6 +375,10 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
         keep_alive,
         websocket,
     } = connection;
+    let tls_enabled = tls_config.is_some();
+    let requires_client_auth = tls_config
+        .as_ref()
+        .is_some_and(|config| config.requires_client_auth());
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(idle_timeout));
 
@@ -365,13 +396,31 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
     // One connection serves many requests; the reader keeps the bytes the
     // HTTP parser already read so a WebSocket upgrade can use them.
     let mut reader = BufReader::new(transport);
+    let mut alpn: Option<String> = None;
+    let mut alpn_checked = false;
 
     loop {
         // A closed connection ends the loop without an answer.
-        match reader.fill_buf() {
-            Ok(buffer) if buffer.is_empty() => return Ok(()),
-            Ok(_) => {}
-            Err(err) => return Err(err),
+        match reader.fill_buf().map(|buffer| buffer.is_empty()) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(err) => {
+                if reader.get_mut().is_handshaking() {
+                    if requires_client_auth {
+                        eprintln!(
+                            "[opurom-server] mTLS handshake refused: client certificate missing, untrusted or revoked (check {} and {}): {}",
+                            tls::CLIENT_CA_ENV, tls::REVOKED_ENV, err
+                        );
+                    } else if tls_enabled {
+                        eprintln!("[opurom-server] TLS handshake failed: {}", err);
+                    }
+                }
+                return Err(err);
+            }
+        }
+        if !alpn_checked {
+            alpn_checked = true;
+            alpn = reader.get_mut().alpn_protocol();
         }
 
         let started = Instant::now();
@@ -420,10 +469,13 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
         let result = write_response_with(&mut reader.get_mut(), &response, reuse);
         if structured_logging_enabled() {
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            eprintln!(
-                "{}",
-                request_log_line(&method, &path, response.status, elapsed_ms)
-            );
+            let line = match alpn.as_deref() {
+                Some(protocol) => {
+                    tls_request_log_line(&method, &path, response.status, elapsed_ms, protocol)
+                }
+                None => request_log_line(&method, &path, response.status, elapsed_ms),
+            };
+            eprintln!("{}", line);
         }
         result?;
         if !reuse {

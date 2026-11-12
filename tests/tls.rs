@@ -50,6 +50,9 @@ impl DemoServer {
             .env_remove("OPR_TLS")
             .env_remove("OPR_TLS_CERT")
             .env_remove("OPR_TLS_KEY")
+            .env_remove("OPR_MTLS")
+            .env_remove("OPR_CLIENT_CA")
+            .env_remove("OPR_REVOKED")
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file));
         for (key, value) in envs {

@@ -1,4 +1,4 @@
-//! OPUROM R2/R4/R5/R7 backend runtime.
+//! OPUROM R2/R4/R5/R7/R8 backend runtime.
 //!
 //! The library uses `serde_json` for IR and JSON responses and `flate2` for
 //! opt-in gzip. It provides:
@@ -8,7 +8,8 @@
 //! * [`middleware`] - middleware, rate limiting, logs and opt-in R5 features.
 //! * [`server`] - a thread-per-connection `TcpListener` server with optional
 //!   TLS and HTTP/1.1 keep-alive.
-//! * [`tls`] - the optional TLS listener with a self-signed fallback.
+//! * [`tls`] - the optional TLS listener with a self-signed fallback, opt-in
+//!   client-certificate mTLS, a static fingerprint deny list and ALPN.
 //! * [`websocket`] - the RFC 6455 frame codec, server channel and client.
 //! * [`ssr`] - deterministic server-side HTML rendering of the same IR tree.
 //! * [`ir`] - the full-stack IR v0.1 data model.
@@ -28,9 +29,9 @@ pub use codegen::lower_service;
 pub use http::{Method, Request, Response, MAX_BODY_BYTES};
 pub use middleware::{
     constant_time_eq, cors_origin_from_env_value, etag_for, rate_limit, rate_limit_from_env,
-    rate_limited_response, request_log_line, structured_logging_enabled, HttpOptions,
-    MiddlewareChain, RateLimiter, AUTH_TOKEN_ENV, CORS_ENV, ETAG_ENV, GZIP_THRESHOLD_BYTES,
-    RATE_LIMIT_ENV, RATE_LIMIT_WINDOW_SECS, STRUCTURED_LOG_ENV,
+    rate_limited_response, request_log_line, structured_logging_enabled, tls_request_log_line,
+    HttpOptions, MiddlewareChain, RateLimiter, AUTH_TOKEN_ENV, CORS_ENV, ETAG_ENV,
+    GZIP_THRESHOLD_BYTES, RATE_LIMIT_ENV, RATE_LIMIT_WINDOW_SECS, STRUCTURED_LOG_ENV,
 };
 pub use router::Router;
 pub use server::{
