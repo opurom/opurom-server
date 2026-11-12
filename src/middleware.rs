@@ -105,6 +105,25 @@ pub fn request_log_line(method: &str, path: &str, status: u16, elapsed_ms: u64) 
     .to_string()
 }
 
+/// One JSON object for a completed TLS request whose peer negotiated ALPN.
+/// The `alpn` value is reported by rustls, not inferred from the HTTP request.
+pub fn tls_request_log_line(
+    method: &str,
+    path: &str,
+    status: u16,
+    elapsed_ms: u64,
+    alpn: &str,
+) -> String {
+    serde_json::json!({
+        "method": method,
+        "path": path,
+        "status": status,
+        "elapsed_ms": elapsed_ms,
+        "alpn": alpn,
+    })
+    .to_string()
+}
+
 /// Plain request-logging layer: prints `METHOD PATH` for every request to
 /// stderr. When structured logging is enabled the server writes one JSON line
 /// instead, so this layer stays silent to avoid a second log line.
