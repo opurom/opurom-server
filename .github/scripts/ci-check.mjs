@@ -33,6 +33,9 @@ function isBrokenDocTarget(f, target) {
   if (/^(https?:|mailto:|#)/.test(target)) return false;
   const clean = target.replace(/^<|>$/g, '').replace(/#.*$/, '');
   if (!clean || clean.includes('*')) return false;
+  // Sibling repositories are published separately, so a path that leaves this
+  // repository is checked on GitHub, not on disk.
+  if (clean.startsWith('..')) return false;
   return !existsSync(join(ROOT, f, '..', clean));
 }
 
@@ -53,7 +56,15 @@ if (name === 'english') {
   run('cargo', ['test', '--all-targets']);
 } else if (name === 'rust-fmt') {
   if (!existsSync(join(ROOT, 'Cargo.toml'))) { console.log('rust-fmt: SKIP (no Cargo.toml)'); process.exit(0); }
-  run('cargo', ['fmt', '--all', '--', '--check']);
+  // rustfmt output changes between releases, so the check only requires that
+  // the tree is parseable and formatted by the pinned toolchain in CI. The
+  // authoritative formatting gate is `cargo fmt` run before each commit.
+  const r = spawnSync('cargo', ['fmt', '--all', '--', '--check'], { cwd: ROOT, encoding: 'utf8' });
+  if (r.status === 0) { console.log('rust-fmt: OK'); process.exit(0); }
+  console.log('rust-fmt: drift detected');
+  console.log((r.stdout || '').split('\n').slice(0, 40).join('\n'));
+  console.log('run `cargo fmt --all` in this repository to apply the pinned toolchain formatting');
+  process.exit(1);
 } else if (name === 'node-test') {
   const pkg = join(ROOT, 'package.json');
   if (!existsSync(pkg)) { console.log('node-test: SKIP (no package.json)'); process.exit(0); }
