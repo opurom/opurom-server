@@ -49,15 +49,22 @@ fn main() {
     chain.push(logging());
     chain.push(body_cap(1024 * 1024));
 
-    let server = match Server::bind_with(&format!("127.0.0.1:{}", port), router, chain, 1024 * 1024)
-    {
+    let addr = format!("127.0.0.1:{}", port);
+    let server = match Server::bind_from_env(&addr, router, chain, 1024 * 1024) {
         Ok(server) => server,
         Err(err) => {
-            eprintln!("opurom-server: cannot bind port {}: {}", port, err);
+            eprintln!("opurom-server: cannot start on {}: {}", addr, err);
             std::process::exit(1);
         }
     };
-    eprintln!("opurom-server demo listening on 127.0.0.1:{}", port);
+    match server.tls_config() {
+        Some(config) => eprintln!(
+            "opurom-server demo listening on https://{} (TLS certificate SHA-256 fingerprint {})",
+            addr,
+            config.fingerprint()
+        ),
+        None => eprintln!("opurom-server demo listening on http://{}", addr),
+    }
     server.serve();
 }
 

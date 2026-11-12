@@ -58,6 +58,8 @@ pub struct Request {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub params: BTreeMap<String, String>,
+    /// The protocol version of the request line, for example `HTTP/1.1`.
+    pub version: String,
 }
 
 impl Request {
@@ -299,6 +301,7 @@ pub fn read_request<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Reque
         headers,
         body,
         params: BTreeMap::new(),
+        version: version.to_string(),
     })
 }
 
