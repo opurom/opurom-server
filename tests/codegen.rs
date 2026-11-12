@@ -167,6 +167,10 @@ fn lowering_shares_one_pooled_database() {
     assert!(!main.contains("Arc::clone"), "{}", main);
     assert!(readme.contains("OPR_RATE_LIMIT"), "{}", readme);
     assert!(readme.contains("OPR_LOG_JSON"), "{}", readme);
+    assert!(readme.contains("OPR_AUTH_TOKEN"), "{}", readme);
+    assert!(readme.contains("OPR_CORS"), "{}", readme);
+    assert!(readme.contains("OPR_ETAG"), "{}", readme);
+    assert!(readme.contains("Accept-Encoding: gzip"), "{}", readme);
     assert!(readme.contains("not a sized connection pool"), "{}", readme);
     let _ = fs::remove_dir_all(&out);
 }

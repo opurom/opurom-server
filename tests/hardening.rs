@@ -49,6 +49,9 @@ impl DemoServer {
             .env_remove("OPR_PORT")
             .env_remove("OPR_RATE_LIMIT")
             .env_remove("OPR_LOG_JSON")
+            .env_remove("OPR_AUTH_TOKEN")
+            .env_remove("OPR_CORS")
+            .env_remove("OPR_ETAG")
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
         for (key, value) in envs {
