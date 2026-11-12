@@ -1,25 +1,27 @@
 # opurom-server
 
-OPUROM R2/R4/R5/R7/R8 backend runtime: a small HTTP/1.1 server, a router with path
-parameters, per-route fault isolation, a deterministic SSR host, R4 hardening
-(pooled SQLite, fixed-window rate limiting, structured logs), opt-in R5 HTTP
-features (bearer auth, gzip, ETag, CORS), opt-in R7 transport features (TLS,
+OPUROM R2/R4/R5/R7/R8/R9 backend runtime: a small HTTP/1.1 server with
+ALPN-selected HTTP/2, a router with path parameters, per-route fault
+isolation, a deterministic SSR host, R4 hardening (pooled SQLite,
+fixed-window rate limiting, structured logs), opt-in R5 HTTP features
+(bearer auth, gzip, ETag, CORS), opt-in R7 transport features (TLS,
 WebSocket, HTTP/1.1 keep-alive), opt-in R8 TLS features (mutual TLS, a static
-certificate revocation deny list and ALPN reporting), and `opurom-serverc`, the
-compiler that lowers a full-stack IR into a standalone Rust service crate.
+certificate revocation deny list and ALPN reporting), and `opurom-serverc`,
+the compiler that lowers a full-stack IR into a standalone Rust service crate.
 
 This crate implements the backend half of
 [`FULLSTACK_SPEC.md`](../opurom-spec/FULLSTACK_SPEC.md) sections 4-5,
 [`R4_ADDENDUM.md`](../opurom-spec/R4_ADDENDUM.md) section 6,
 [`R5_ADDENDUM.md`](../opurom-spec/R5_ADDENDUM.md) section 6,
-[`R7_ADDENDUM.md`](../opurom-spec/R7_ADDENDUM.md) sections 1 and 5 and
-[`R8_ADDENDUM.md`](../opurom-spec/R8_ADDENDUM.md) section 4.
+[`R7_ADDENDUM.md`](../opurom-spec/R7_ADDENDUM.md) sections 1 and 5,
+[`R8_ADDENDUM.md`](../opurom-spec/R8_ADDENDUM.md) section 4 and
+[`R9_ADDENDUM.md`](../opurom-spec/R9_ADDENDUM.md) section 2.
 
 ## Architecture
 
 ```
-TCP connection -> http::read_request
-                  request line + headers + Content-Length
+TCP/HTTP request -> HTTP/1.1 parser or HTTP/2 mapping
+                  request line + headers, or HEADERS/DATA + HPACK
                   body cap 1 MiB -> 413
                -> middleware::MiddlewareChain
                   logging (plain by default) + body cap
@@ -40,13 +42,15 @@ TCP connection -> http::read_request
                 -> server::Server optional OPR_LOG_JSON line to stderr
 ```
 
-The R7/R8 transport layer wraps that core:
+The R7/R8/R9 transport layer wraps that core:
 
 ```
 accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
            OPR_MTLS=1: require a client certificate, apply the static deny list
            ALPN: advertise h2/http/1.1, report the selected protocol
-       -> optional WebSocket upgrade (RFC 6455, OPR_WEBSOCKET=1)
+        -> h2: http2::serve (HEADERS/DATA, HPACK, streams, flow control, GOAWAY)
+           -> same middleware/router/response features
+       -> http/1.1 or no ALPN: optional WebSocket upgrade (RFC 6455, OPR_WEBSOCKET=1)
        -> HTTP/1.1 keep-alive loop (OPR_KEEPALIVE=1)
           Content-Length framing, idle timeout, in-flight limit
 ```
@@ -54,9 +58,10 @@ accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
 | Module | Responsibility |
 | --- | --- |
 | `http` | `Method`, `Request`, `Response`, the bounded request parser, status text |
+| `http2` | ALPN-selected HTTP/2: h2 HEADERS/DATA, HPACK, stream multiplexing, flow control, bounded settings, graceful GOAWAY and mapping into the shared request pipeline |
 | `middleware` | `MiddlewareChain`, `RateLimiter`, logging helpers, body cap, opt-in R5 HTTP options |
 | `router` | route table, `:param` matching, panic isolation, 3-strike breaker |
-| `server` | `TcpListener` accept loop, one thread per connection, optional TLS, optional keep-alive, optional WebSocket upgrade, R5 response features and measured JSON log |
+| `server` | `TcpListener` accept loop, one thread per connection, optional TLS, ALPN-selected HTTP/2, optional keep-alive, optional WebSocket upgrade, R5 response features and measured JSON log |
 | `tls` | the optional TLS listener: environment configuration, PEM loading, self-signed fallback, SHA-256 fingerprint, opt-in client-certificate mTLS, static fingerprint deny list and ALPN |
 | `websocket` | the RFC 6455 frame codec with size limits, the server channel and the client helper |
 | `ssr` | deterministic HTML rendering of the IR tree with theme tokens |
@@ -87,6 +92,12 @@ handler is caught, and no failure path aborts the process.
   `OPR_REVOKED`, plain HTTP and the R7 single-sided TLS HTTP response bytes
   stay byte-identical. A TLS client that offers no ALPN negotiates no
   protocol and gets the same four-field request log line.
+* R9 HTTP/2 is selected solely by ALPN `h2` on the TLS listener; no new
+  environment variable is needed. Requests arrive as HEADERS/DATA frames and
+  pass through the same middleware and router. Responses use h2 HEADERS/DATA
+  frames, preserve status, body and opt-in R5 headers, set an exact
+  `Content-Length` and omit HTTP/1.1 `Connection` headers. Plain HTTP, no
+  ALPN and `http/1.1` ALPN keep the R8 HTTP/1.1 wire bytes.
 
 | Situation | Status | Body |
 | --- | --- | --- |
@@ -247,12 +258,13 @@ An unauthorized request still counts against `OPR_RATE_LIMIT` and gets an
 headers compose on one response, and `304` keeps CORS headers but has no
 compressed body. The generated service's one shared `PooledDb` is unchanged.
 
-Still R6+: a real authentication/identity provider, token lifecycle,
-per-route CORS and credentialed CORS, streaming, HTTP/2, compression
-dictionaries, Brotli/zstd, chunked bodies, a sized connection pool and a
-distributed rate limit. There is no streaming compression: each response is
-encoded in memory. ETags are body hashes, not a versioned cache-invalidation
-system.
+Still R10+: a real authentication/identity provider, token lifecycle,
+per-route CORS and credentialed CORS, application-level response streaming,
+compression dictionaries, Brotli/zstd, chunked HTTP/1.1 bodies, a sized
+connection pool and a distributed rate limit. R9 h2 applies the same
+whole-response features; there is no streaming compression because each
+response is encoded in memory before h2 frames it. ETags are body hashes, not
+a versioned cache-invalidation system.
 
 ## R7 transport features (opt-in)
 
@@ -372,8 +384,8 @@ Both values are settable in code with `Server::with_idle_timeout` and
 * **No permessage-deflate**: the WebSocket implementation negotiates no
   extensions and never compresses a frame. `Sec-WebSocket-Extensions` is
   neither sent nor honoured.
-* **No HTTP/2 frames and no HTTP/3**: R8 adds ALPN advertisement and
-  reporting, but the server still speaks HTTP/1.1 only. There is no QUIC.
+* **No HTTP/3/QUIC**: R8 added ALPN advertisement and reporting; R9 serves
+  real HTTP/2 frames when ALPN selects `h2`. QUIC is not implemented.
 * **No load-balancer integration**: no `X-Forwarded-*` handling, no
   `Forwarded` header parsing, no sticky-session or health-probe support for
   a proxy, and no proxy-protocol support.
@@ -384,15 +396,16 @@ Both values are settable in code with `Server::with_idle_timeout` and
 * **The keep-alive loop is per connection**: one thread per connection is
   still the model, so the idle timeout bounds each thread rather than a
   shared pool.
-* **Still R9+**: HTTP/2 frames, HTTP/3, OCSP/CRL fetch and distributed
-  revocation, permessage-deflate, a sized connection pool with a shared event
-  loop, and load-balancer integration.
+* **Still R10+**: HTTP/3, OCSP/CRL fetch and distributed revocation,
+  permessage-deflate, a sized connection pool with a shared event loop, and
+  load-balancer integration.
 
 ## R8 mutual TLS, revocation and ALPN (opt-in)
 
 R8 extends the same rustls listener. Plain HTTP is unchanged. With no R8
 variable set, the R7 single-sided TLS path keeps its HTTP response bytes; a
 client that offers no ALPN negotiates no protocol and sees no extra log field.
+R9 adds real h2 frames on a TLS connection whose ALPN selection is `h2`.
 `OPR_MTLS=1` also enables TLS, so `OPR_TLS=1` is optional (setting both is
 harmless). All three R8 variables are read once at startup.
 
@@ -424,7 +437,8 @@ stderr, for example:
 [opurom-server] mTLS handshake refused: client certificate missing, untrusted or revoked (check OPR_CLIENT_CA and OPR_REVOKED): peer sent no certificates
 ```
 
-A trusted client receives an ordinary HTTP/1.1 response. Setting `OPR_MTLS=1`
+A trusted client receives the negotiated response: unchanged HTTP/1.1 for
+`http/1.1` or no ALPN, and real h2 frames for `h2`. Setting `OPR_MTLS=1`
 without `OPR_CLIENT_CA` is a startup error that names the missing variable.
 `OPR_CLIENT_CA` accepts a PEM file path (the same convention as
 `OPR_TLS_CERT`) or an inline PEM string.
@@ -457,23 +471,73 @@ log gains an `alpn` field. A measured R8 sample:
 ```
 
 When the client offers no ALPN, no protocol is selected and the log keeps its
-four R4 fields. **The server still parses HTTP/1.1 only**: selecting `h2`
-does not enable HTTP/2 frames. R8 implements negotiation and reporting, not a
-second HTTP implementation.
+four R4 fields. R8 implemented negotiation and reporting only; R9 now serves
+HTTP/2 when `h2` is selected and keeps the unchanged HTTP/1.1 parser when
+`http/1.1` is selected. Each completed h2 stream writes the same structured
+log fields with `"alpn":"h2"`.
 
 ### R8 honest scope
 
-* No HTTP/2 frame implementation, no HPACK, no streams, no prioritisation and
-  no HTTP/3/QUIC.
+* R8 had no HTTP/2 frame implementation; R9 adds HPACK, HEADERS/DATA frames,
+  streams and flow control. There is still no client-controlled priority tree
+  or HTTP/3/QUIC.
 * No OCSP, OCSP stapling, CRL fetch, distributed revocation, certificate
   status protocol or revocation cache of any kind.
 * No HSM, no private-key isolation, no certificate transparency, no SCT
   validation and no cipher-suite tuning beyond the rustls defaults.
 * The client CA and the deny list are static, process-local configuration;
   there is no identity store, no per-client authorization and no rotation.
-* Still R9+: HTTP/2 frames, OCSP/CRL fetch, distributed revocation, HSM,
+* Still R10+: HTTP/3/QUIC, OCSP/CRL fetch, distributed revocation, HSM,
   certificate transparency, permessage-deflate, a sized connection pool and
   load-balancer integration.
+
+## R9 real HTTP/2 (ALPN-selected)
+
+`OPR_TLS=1` or `OPR_MTLS=1` enables the existing rustls listener. **No new
+environment variable enables HTTP/2**: rustls ALPN decides. A client that
+selects `h2` gets real HTTP/2 on that TLS connection; `http/1.1` or no ALPN
+keeps the unchanged HTTP/1.1 path. Plain HTTP stays byte-identical.
+
+The `h2` crate handles the HTTP/2 connection preface, HPACK, HEADERS/DATA
+frames, stream multiplexing and stream/connection flow control. One
+current-thread Tokio runtime is created per negotiated h2 connection; the
+outer server remains thread-per-connection. Each h2 request is converted into
+the existing `http::Request` (method, path, query, headers and bounded DATA
+body) and goes through `server::dispatch_request`: the same middleware chain,
+rate limiter, CORS preflight, bearer auth, router, fault isolation, R5
+ETag/gzip/CORS finalization and structured log. Response headers are copied
+to h2 HEADERS except HTTP/1.1 connection-specific fields; an exact
+`Content-Length` is set and the body is sent as DATA frames. Empty `204`/`304`
+responses close the stream with HEADERS only.
+
+| Limit | Value | Purpose |
+| --- | --- | --- |
+| Frame payload | 16,384 bytes | `SETTINGS_MAX_FRAME_SIZE`; h2 splits outbound DATA to the peer's frame size |
+| Concurrent client streams | 100 | `SETTINGS_MAX_CONCURRENT_STREAMS`; further streams are reset |
+| HPACK header list | 64 KiB | maximum uncompressed received header list |
+| Initial receive window | 1 MiB | per stream and per connection |
+| Per-stream send buffer | 1 MiB | bounded queued DATA |
+| Request body | 1 MiB | the existing `http::MAX_BODY_BYTES`; overflow gets 413 |
+
+The server watches the existing `Server::shutdown_handle()`. On shutdown it
+calls h2 graceful shutdown, sends an initial `GOAWAY` with
+`last_stream_id=2^31-1` and `NO_ERROR`, waits for the PING/PONG round trip,
+drains active streams and sends the final `GOAWAY` with the actual last stream
+ID. A raw-frame test verifies both GOAWAY frames and the `NO_ERROR` code.
+
+A real h2 client opens one TLS connection and several concurrent streams. One
+five-stream test yields `GET /health -> 200`, `GET /items/42?q=one -> 200`,
+`POST /echo -> 200`, `OPTIONS /health -> 204` and
+`GET /blocked -> 418`, with exact bodies and ETag/CORS headers. A second test
+sends a 256 KiB response and a 128 KiB request across flow-control windows on
+the same connection while `GET /panic -> 500` leaves `GET /health -> 200`
+intact.
+
+Honest scope: no HTTP/3/QUIC, no server push, no client-controlled priority
+tree, no connection coalescing across origins, no h2 extended CONNECT or
+WebSocket-over-h2 upgrade, and no trailers. There is no application-level
+streaming: each response body is built in memory before h2 frames it. These
+remain R10+.
 
 ## Generated service (`opurom-serverc`)
 
@@ -503,7 +567,8 @@ The generator writes a standalone crate into `<dir>`:
   through the runtime described above. The R7 transport variables
   `OPR_TLS`, `OPR_TLS_CERT`, `OPR_TLS_KEY`, `OPR_KEEPALIVE` and
   `OPR_WEBSOCKET` work the same way. The R8 TLS variables `OPR_MTLS`,
-  `OPR_CLIENT_CA` and `OPR_REVOKED` work the same way too.
+  `OPR_CLIENT_CA` and `OPR_REVOKED` work the same way too. R9 h2 is selected
+  by ALPN on those TLS listeners; it needs no new variable.
 * The schema is created at startup inside one `PooledDb::with` call: every
   `migrations/*.sql` statement is embedded with `include_str!` and executed
   (they are `CREATE TABLE IF NOT EXISTS`, so startup is idempotent).
@@ -517,7 +582,7 @@ OPR_PORT=8787 OPR_DB=./opurom.db <dir>/target/release/opurom-service
 
 The generated service no longer opens one connection per request. It shares
 the one Mutex-serialized connection from `PooledDb`; real connection pool
-sizing remains R9+.
+sizing remains R10+.
 
 ## Demo server
 
@@ -528,7 +593,8 @@ cargo run --bin opurom-server -- 8787      # or: OPR_PORT=8787 cargo run --bin o
 The demo serves `/health`, `/ssr` and an in-memory `/todos` collection with the
 five CRUD verbs. It uses the same optional rate limiter, structured logging
 and opt-in R5 HTTP features as generated services, and it understands the
-opt-in R7/R8 transport variables:
+opt-in R7/R8 transport variables. When TLS is on, ALPN `h2` selects the R9
+HTTP/2 path without another variable:
 
 ```sh
 OPR_TLS=1 OPR_KEEPALIVE=1 OPR_WEBSOCKET=1 cargo run --bin opurom-server -- 8787
@@ -538,9 +604,9 @@ OPR_MTLS=1 OPR_CLIENT_CA=client-ca.pem OPR_LOG_JSON=1 \
 
 ## Dependencies
 
-The R7 transport features add seven pinned dependencies; R8 adds none.
-Every version is pinned with `=` so a rebuild cannot pull a different
-release.
+The R7 transport features add seven pinned dependencies; R8 adds none; R9
+adds five pinned dependencies. Every direct version is pinned with `=` so a
+rebuild cannot pull a different release.
 
 | Crate | Version | Why |
 | --- | --- | --- |
@@ -551,12 +617,19 @@ release.
 | `sha1` | 0.10.6 | the SHA-1 of the WebSocket handshake key, as RFC 6455 requires |
 | `base64` | 0.23.1 | the base64 handshake accept value and the client key |
 | `getrandom` | 0.2.17 | the random bytes for a WebSocket key and for a frame mask |
+| `h2` | 0.4.20 | HTTP/2 HEADERS/DATA frames, HPACK, multiplexed streams, flow control and GOAWAY |
+| `http` | 1.5.0 | request and response header/status types used by the h2 API |
+| `bytes` | 1.12.1 | bounded DATA frame buffers |
+| `tokio` | 1.54.1 | current-thread runtime, sockets, timers and task sets for h2 connections |
+| `tokio-rustls` | 0.26.6 | async TLS handshake exposing the selected ALPN protocol |
 
 `rcgen` is built with `default-features = false` and only the `crypto`,
 `pem` and `ring` features, so its optional `x509-parser` and `aws-lc-rs`
 paths are not compiled in. `rustls` is built with `default-features = false`
 and only `ring`, `std`, `tls12` and `logging`, so no system TLS library is
-needed.
+needed. `tokio` uses `default-features = false` with only `io-util`, `macros`,
+`net`, `rt`, `sync` and `time`; `tokio-rustls` uses `default-features = false`
+with `ring`, `tls12` and `logging`, so R9 does not pull in `aws-lc-rs`.
 
 ## Tests
 
@@ -566,8 +639,8 @@ cargo test
 ```
 
 All 67 R7 tests remain green: 37 from R6 and 30 from R7. The R8 suite adds
-9 more, for 76 in total. Several suites drive a real server on an ephemeral
-port over TCP:
+9 more, for 76 in total; R9 adds 3, for 79. Several suites drive a real server
+on an ephemeral port over TCP:
 
 | Test file | Covers |
 | --- | --- |
@@ -579,7 +652,8 @@ port over TCP:
 | `tests/tls.rs` | a real TLS handshake over a real socket, an untrusted certificate refused by the client, the SHA-256 fingerprint and the private key never logged, a missing certificate file, a certificate without a key naming the missing variable, a corrupt PEM, a mismatched certificate and key pair, the demo server exiting with a clear error, plain HTTP staying byte-identical |
 | `tests/websocket.rs` | the RFC 6455 handshake with the documented accept value, a text frame round trip, a binary frame round trip, ping answered with pong, a close frame with its code and reason, a message reassembled from two fragments, a message reassembled from three fragments, an oversized frame refused before allocation, an unmasked client frame refused, the client refusing a wrong accept value and a non-101 answer |
 | `tests/keepalive.rs` | two requests on one socket, a `Connection: close` request ending the connection, the idle timeout closing a silent connection, the in-flight limit answering 503, the documented default limits, the demo server with and without `OPR_KEEPALIVE` |
-| `tests/mtls.rs` | real sockets with an rcgen CA -> server chain -> client cert chain, `OPR_MTLS=1` alone enabling TLS, a trusted client accepted, missing and self-signed untrusted clients refused, a revoked-but-trusted cert refused and a non-revoked one accepted, a spoofed fingerprint header ignored, `h2`/`http/1.1` ALPN selection and reporting, the structured log `alpn` field, clear mTLS refusal diagnostics, and the byte-identical R7 single-sided TLS answer |
+| `tests/mtls.rs` | real sockets with an rcgen CA -> server chain -> client cert chain, `OPR_MTLS=1` alone enabling TLS, a trusted client accepted, missing and self-signed untrusted clients refused, a revoked-but-trusted cert refused and a non-revoked one accepted, a spoofed fingerprint header ignored, `h2`/`http/1.1` ALPN selection with a real h2 client for `h2`, the structured log `alpn` field, clear mTLS refusal diagnostics, and the byte-identical R7 single-sided TLS answer |
+| `tests/http2.rs` | `h2_concurrent_streams_share_one_tls_connection`, `h2_large_body_flow_control_isolates_failed_stream` and `h2_shutdown_sends_graceful_goaway`: one real h2 client connection with several concurrent streams, exact statuses/bodies and R5 response features, 256 KiB response and 128 KiB request across flow-control windows, panic isolation, and raw-frame initial/final GOAWAY with PING/PONG |
 
 The in-process tests are self-contained: they use an in-memory store, not
 `opurom-db`, so `cargo test` passes in this repository on its own. The
@@ -607,27 +681,30 @@ Implemented and verified in this repository:
 | CORS / preflight | Implemented, opt-in fixed origin or literal `*`, 204 with fixed allow lists |
 | `opurom-serverc` lowering to a standalone crate | Implemented, tested |
 | TLS listener | Implemented, opt-in via `OPR_TLS=1`, rustls with a self-signed fallback, fingerprint logged, real handshake tested |
+| Real HTTP/2 | Implemented, ALPN-selected `h2` only, h2 0.4.20 frames/HPACK/multiplexing/flow control, shared router/middleware, bounded limits and graceful GOAWAY; no new environment variable |
 | Mutual TLS client certificates | Implemented, opt-in via `OPR_MTLS=1` + `OPR_CLIENT_CA`, mandatory rustls verification over real sockets |
 | Certificate revocation | Implemented as a static `OPR_REVOKED` fingerprint deny list over presented peer certificates; NOT OCSP or a distributed CRL |
-| ALPN negotiation and reporting | Implemented, `h2` and `http/1.1` advertised, selected protocol in the structured log and test output; no HTTP/2 frames |
+| ALPN negotiation and reporting | Implemented, `h2` and `http/1.1` advertised, selected protocol in the structured log; R9 serves h2 frames when `h2` is selected |
 | WebSocket (RFC 6455) | Implemented, opt-in via `OPR_WEBSOCKET=1`, handshake, text, binary, ping/pong, close and fragmentation, bounded frames |
 | HTTP/1.1 keep-alive | Implemented, opt-in via `OPR_KEEPALIVE=1`, `Content-Length` framing, idle timeout, in-flight limit |
 
-Not implemented (R9+):
+Not implemented (R10+):
 
 | Area | Status |
 | --- | --- |
-| HTTP/2 frames and HTTP/3 | Not implemented (ALPN advertisement only, HTTP/1.1 parser only, no QUIC) |
+| HTTP/3 / QUIC | Not implemented (R9 h2 runs over rustls/TCP only) |
+| HTTP/2 server push, priority tree and coalescing | Not implemented (no push promises, no client-controlled priority tree and no cross-origin connection reuse) |
+| HTTP/2 extended CONNECT, WebSocket-over-h2, trailers | Not implemented (the RFC 6455 upgrade remains HTTP/1.1 only) |
 | OCSP / CRL fetch / distributed revocation | Not implemented (a static process-local fingerprint deny list only) |
 | HSM and certificate transparency | Not implemented (no private-key isolation, no SCT validation) |
 | `permessage-deflate` | Not implemented (no extension is negotiated, no frame is compressed) |
 | Load-balancer integration | Not implemented (no `X-Forwarded-*`, no `Forwarded`, no proxy protocol) |
 | Real authentication provider / token lifecycle | Not implemented (development bearer token only) |
-| Real connection pool sizing | Not implemented (one shared Mutex-guarded connection only, one thread per connection) |
+| Real connection pool sizing | Not implemented (one shared Mutex-guarded connection only, one thread per TCP connection) |
 | Distributed rate limiting | Not implemented (in-process counters only) |
 | PostgreSQL / MySQL drivers | Not implemented in this repository (SQLite and the `opurom-db` KV/Memory drivers only) |
 | Node.js / Serverless deployment | Not implemented |
 | Per-route CORS, credentialed CORS | Not implemented (one fixed configured origin or `*`; no cookies or credentials) |
-| Streaming, HTTP/2 frames, compression dictionaries | Not implemented (whole-body gzip only, HTTP/1.1 only) |
+| Application streaming and compression dictionaries | Not implemented (whole-body gzip only; each response is built in memory before h2 DATA frames) |
 | Real device benchmarks | Not implemented; no fabricated numbers |
-| Chunked request bodies | Not implemented (`Transfer-Encoding` is still rejected with 501) |
+| Chunked HTTP/1.1 request bodies | Not implemented (`Transfer-Encoding` is still rejected with 501; h2 uses DATA frames) |

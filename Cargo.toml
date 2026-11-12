@@ -3,7 +3,7 @@ name = "opurom-server"
 version = "0.2.0"
 edition = "2021"
 publish = false
-description = "OPUROM R2/R4/R5 backend runtime: HTTP/1.1, routing, fault isolation, SSR host, opt-in hardening, and service lowering"
+description = "OPUROM R2/R4/R5/R7/R8/R9 backend runtime: HTTP/1.1, HTTP/2, routing, fault isolation, SSR host, opt-in hardening, and service lowering"
 
 [lib]
 name = "opurom_server"
@@ -36,3 +36,14 @@ sha2 = "=0.10.9"
 sha1 = "=0.10.6"
 base64 = "=0.23.1"
 getrandom = "=0.2.17"
+
+# R9 HTTP/2 dependencies, pinned exactly.
+# h2: HEADERS/DATA frames, HPACK, streams, flow control and GOAWAY.
+# http/bytes: the request and response types used by the h2 API.
+# tokio: the async runtime and socket used only by negotiated TLS connections.
+# tokio-rustls: the async TLS handshake that exposes the selected ALPN protocol.
+h2 = "=0.4.20"
+http = "=1.5.0"
+bytes = "=1.12.1"
+tokio = { version = "=1.54.1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }

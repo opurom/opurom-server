@@ -8,9 +8,12 @@
 //! * `OPR_WEBSOCKET=1` accepts RFC 6455 upgrades.
 //!
 //! R8 adds opt-in `OPR_MTLS=1` client certificates, the `OPR_REVOKED` static
-//! fingerprint deny list and ALPN reporting. With none of the R8 variables
-//! set and no client ALPN offer, the R7 wire format and response bytes stay
-//! identical.
+//! fingerprint deny list and ALPN reporting. R9 serves real HTTP/2 when ALPN
+//! selects `h2`; every other connection keeps the HTTP/1.1 path. No new
+//! environment variable enables HTTP/2.
+//!
+//! With none of the R8 variables set, no client ALPN offer and no `h2`
+//! negotiation, the R7 wire format and response bytes stay identical.
 //!
 //! Connections are bounded by an idle timeout and a maximum number of
 //! in-flight connections.
@@ -25,8 +28,11 @@ use std::time::{Duration, Instant};
 
 use rustls::server::ServerConnection;
 use rustls::StreamOwned;
+use tokio::net::TcpStream as TokioTcpStream;
+use tokio_rustls::TlsAcceptor;
 
 use crate::http::{read_request, status_text, Request, Response, MAX_BODY_BYTES};
+use crate::http2::{self, State as H2State};
 use crate::middleware::{
     apply_response_features, authorized, cors_preflight, rate_limited_response, request_log_line,
     structured_logging_enabled, tls_request_log_line, unauthorized_response, HttpOptions,
@@ -214,6 +220,7 @@ impl Server {
             let idle_timeout = self.idle_timeout;
             let keep_alive = self.keep_alive;
             let websocket = self.websocket;
+            let shutdown = Arc::clone(&self.shutdown);
             let in_flight = Arc::clone(&self.in_flight);
             let current = in_flight.fetch_add(1, Ordering::Relaxed);
             if current >= self.max_connections {
@@ -235,6 +242,7 @@ impl Server {
                         idle_timeout,
                         keep_alive,
                         websocket,
+                        shutdown,
                     },
                 );
                 in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -310,27 +318,6 @@ impl Write for Transport {
 }
 
 impl Transport {
-    /// The ALPN protocol rustls selected during the handshake, if any.
-    fn alpn_protocol(&self) -> Option<String> {
-        match self {
-            Transport::Plain(_) => None,
-            Transport::Tls(Some(stream)) => stream
-                .conn
-                .alpn_protocol()
-                .map(|protocol| String::from_utf8_lossy(protocol).into_owned()),
-            Transport::Tls(None) => None,
-        }
-    }
-
-    /// True while a TLS handshake is still in progress.
-    fn is_handshaking(&self) -> bool {
-        match self {
-            Transport::Plain(_) => false,
-            Transport::Tls(Some(stream)) => stream.conn.is_handshaking(),
-            Transport::Tls(None) => false,
-        }
-    }
-
     /// Close the connection. A TLS connection sends `close_notify` first so
     /// the peer sees a clean shutdown instead of a truncated stream.
     fn shutdown(&mut self) -> std::io::Result<()> {
@@ -359,10 +346,11 @@ struct Connection {
     idle_timeout: Duration,
     keep_alive: bool,
     websocket: bool,
+    shutdown: Arc<AtomicBool>,
 }
 
-/// Serve one connection: read requests until the peer closes, the client
-/// asks for `Connection: close`, or the idle timeout expires.
+/// Serve one connection. An ALPN-selected `h2` connection owns a Tokio
+/// runtime; every other connection uses the unchanged HTTP/1.1 loop.
 fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Result<()> {
     let Connection {
         router,
@@ -374,53 +362,95 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
         idle_timeout,
         keep_alive,
         websocket,
+        shutdown,
     } = connection;
-    let tls_enabled = tls_config.is_some();
     let requires_client_auth = tls_config
         .as_ref()
         .is_some_and(|config| config.requires_client_auth());
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(idle_timeout));
+    let report_handshake_error = |err: &std::io::Error| {
+        if requires_client_auth {
+            eprintln!(
+                "[opurom-server] mTLS handshake refused: client certificate missing, untrusted or revoked (check {} and {}): {}",
+                tls::CLIENT_CA_ENV, tls::REVOKED_ENV, err
+            );
+        } else {
+            eprintln!("[opurom-server] TLS handshake failed: {}", err);
+        }
+    };
 
-    let transport = match tls_config {
-        Some(config) => match config.connect() {
-            Ok(connection) => Transport::Tls(Some(Box::new(StreamOwned::new(connection, stream)))),
-            Err(err) => {
-                eprintln!("[opurom-server] TLS handshake failed: {}", err);
-                return Ok(());
+    let (transport, alpn) = match tls_config {
+        Some(config) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            stream.set_nonblocking(true)?;
+            let tokio_stream = {
+                let _guard = runtime.enter();
+                TokioTcpStream::from_std(stream)?
+            };
+            let acceptor = TlsAcceptor::from(config.server_config());
+            let handshake = async move {
+                tokio::time::timeout(idle_timeout, acceptor.accept(tokio_stream)).await
+            };
+            let tls_stream = match runtime.block_on(handshake) {
+                Ok(Ok(tls_stream)) => tls_stream,
+                Ok(Err(err)) => {
+                    report_handshake_error(&err);
+                    return Ok(());
+                }
+                Err(_) => {
+                    let err = std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "TLS handshake timed out",
+                    );
+                    report_handshake_error(&err);
+                    return Ok(());
+                }
+            };
+            let alpn = tls_stream
+                .get_ref()
+                .1
+                .alpn_protocol()
+                .map(|protocol| String::from_utf8_lossy(protocol).into_owned());
+            if alpn.as_deref() == Some("h2") {
+                let state = H2State {
+                    router: Arc::clone(&router),
+                    middleware: Arc::clone(&middleware),
+                    limiter: limiter.clone(),
+                    options: Arc::clone(&options),
+                    max_body,
+                };
+                return http2::serve(runtime, tls_stream, state, shutdown);
             }
-        },
-        None => Transport::Plain(stream),
+
+            // Continue with the original blocking HTTP/1.1 transport. The
+            // rustls state keeps any plaintext that arrived with the handshake.
+            let (tokio_stream, server_connection) = tls_stream.into_inner();
+            let stream = {
+                let _guard = runtime.enter();
+                tokio_stream.into_std()?
+            };
+            stream.set_nonblocking(false)?;
+            let _ = stream.set_read_timeout(Some(idle_timeout));
+            (
+                Transport::Tls(Some(Box::new(StreamOwned::new(server_connection, stream)))),
+                alpn,
+            )
+        }
+        None => (Transport::Plain(stream), None),
     };
 
     // One connection serves many requests; the reader keeps the bytes the
     // HTTP parser already read so a WebSocket upgrade can use them.
     let mut reader = BufReader::new(transport);
-    let mut alpn: Option<String> = None;
-    let mut alpn_checked = false;
-
     loop {
         // A closed connection ends the loop without an answer.
         match reader.fill_buf().map(|buffer| buffer.is_empty()) {
             Ok(true) => return Ok(()),
             Ok(false) => {}
-            Err(err) => {
-                if reader.get_mut().is_handshaking() {
-                    if requires_client_auth {
-                        eprintln!(
-                            "[opurom-server] mTLS handshake refused: client certificate missing, untrusted or revoked (check {} and {}): {}",
-                            tls::CLIENT_CA_ENV, tls::REVOKED_ENV, err
-                        );
-                    } else if tls_enabled {
-                        eprintln!("[opurom-server] TLS handshake failed: {}", err);
-                    }
-                }
-                return Err(err);
-            }
-        }
-        if !alpn_checked {
-            alpn_checked = true;
-            alpn = reader.get_mut().alpn_protocol();
+            Err(err) => return Err(err),
         }
 
         let started = Instant::now();
@@ -434,28 +464,13 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
                 }
                 let method = request.method.as_str().to_string();
                 let path = request.path.clone();
-                let mut response = match middleware.apply(&mut request) {
-                    Some(response) => response,
-                    None => match limiter.as_ref().and_then(|limiter| limiter.check(&request)) {
-                        Some(retry_after) => rate_limited_response(retry_after),
-                        None => {
-                            if let Some(preflight) =
-                                cors_preflight(&request, options.cors_origin.as_deref())
-                            {
-                                preflight
-                            } else if options
-                                .auth_token
-                                .as_deref()
-                                .is_some_and(|token| !authorized(&request, token))
-                            {
-                                unauthorized_response()
-                            } else {
-                                router.handle(&mut request)
-                            }
-                        }
-                    },
-                };
-                apply_response_features(&mut response, &request, options.as_ref());
+                let response = dispatch_request(
+                    &mut request,
+                    router.as_ref(),
+                    middleware.as_ref(),
+                    limiter.as_deref(),
+                    options.as_ref(),
+                );
                 let reuse = keep_alive && wants_keep_alive(&request);
                 (response, method, path, reuse)
             }
@@ -466,7 +481,7 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
                 false,
             ),
         };
-        let result = write_response_with(&mut reader.get_mut(), &response, reuse);
+        let result = write_response_with(reader.get_mut(), &response, reuse);
         if structured_logging_enabled() {
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let line = match alpn.as_deref() {
@@ -485,6 +500,38 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
             return Ok(());
         }
     }
+}
+
+/// Apply the existing middleware, rate limiter, router and R5 features to one
+/// request. HTTP/1.1 and HTTP/2 share this conversion point.
+pub(crate) fn dispatch_request(
+    request: &mut Request,
+    router: &Router,
+    middleware: &MiddlewareChain,
+    limiter: Option<&RateLimiter>,
+    options: &HttpOptions,
+) -> Response {
+    let mut response = match middleware.apply(request) {
+        Some(response) => response,
+        None => match limiter.and_then(|limiter| limiter.check(request)) {
+            Some(retry_after) => rate_limited_response(retry_after),
+            None => {
+                if let Some(preflight) = cors_preflight(request, options.cors_origin.as_deref()) {
+                    preflight
+                } else if options
+                    .auth_token
+                    .as_deref()
+                    .is_some_and(|token| !authorized(request, token))
+                {
+                    unauthorized_response()
+                } else {
+                    router.handle(request)
+                }
+            }
+        },
+    };
+    apply_response_features(&mut response, request, options);
+    response
 }
 
 /// True when the request may be answered on the same connection.

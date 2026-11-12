@@ -9,10 +9,11 @@
 //! `OPR_MTLS=1` with `OPR_CLIENT_CA` makes the listener require and verify a
 //! client certificate during the rustls handshake. `OPR_REVOKED` is a static,
 //! comma-separated SHA-256 fingerprint deny list, NOT OCSP or a distributed
-//! CRL. Both TLS modes advertise `h2` and `http/1.1` through ALPN.
+//! CRL. Both TLS modes advertise `h2` and `http/1.1` through ALPN; R9 serves
+//! real HTTP/2 frames when `h2` is selected.
 //!
-//! Honest scope: no HTTP/2 frames, no OCSP/CRL fetch, no HSM, no certificate
-//! transparency and no cipher-suite tuning beyond the library defaults.
+//! Honest scope: no OCSP/CRL fetch, no HSM, no certificate transparency and
+//! no cipher-suite tuning beyond the library defaults.
 
 use std::collections::BTreeSet;
 use std::fmt;

@@ -1,7 +1,10 @@
 //! R8 mutual TLS tests over real sockets: a CA-signed server chain, trusted
 //! and untrusted client certificates, a static fingerprint deny list, ALPN
-//! negotiation and the operator-facing diagnostics. All certificates and
-//! private keys are generated in memory with rcgen; none are checked in.
+//! negotiation and the operator-facing diagnostics. R9 uses a real h2 client
+//! where ALPN selects `h2`. All certificates and private keys are generated
+//! in memory with rcgen; none are checked in.
+
+mod support;
 
 use std::fs;
 use std::io::{BufReader, Read, Write};
@@ -25,11 +28,13 @@ use rcgen::{
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde_json::Value;
+use support::h2::{exchange, Identity as H2Identity, RequestSpec};
 
 static NONCE: AtomicU64 = AtomicU64::new(0);
 
 const REQUEST: &str = "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 const HEALTH_BODY: &str = "{\"ok\":true}";
+const DEMO_HEALTH_BODY: &str = "{\"ok\":true,\"app\":\"opurom-server-demo\",\"version\":\"0.2.0\"}";
 
 /// One generated client identity. The chain PEM may contain the issuing CA.
 #[derive(Clone)]
@@ -151,6 +156,13 @@ fn demo_router() -> Router {
     router
 }
 
+fn h2_identity(identity: &ClientIdentity) -> H2Identity {
+    H2Identity {
+        chain_pem: identity.chain_pem.clone(),
+        key_pem: identity.key_pem.clone(),
+    }
+}
+
 /// Start an mTLS server with the CA-signed server chain and a deny list.
 fn start_mtls_server(pki: &Pki, revoked: &[String]) -> (u16, Arc<std::sync::atomic::AtomicBool>) {
     let options = MtlsOptions {
@@ -270,7 +282,7 @@ fn trusted_client_certificate_completes_a_real_mtls_handshake() {
         port,
         &pki.ca_der,
         Some(&pki.trusted_client),
-        &["h2", "http/1.1"],
+        &["http/1.1"],
         REQUEST,
     )
     .expect("a CA-signed client certificate completes mTLS");
@@ -380,25 +392,43 @@ fn alpn_advertises_h2_and_http_1_1_and_reports_selection() {
     assert_eq!(tls::ALPN_PROTOCOLS, &["h2", "http/1.1"]);
     let pki = pki();
     let (port, shutdown) = start_mtls_server(&pki, &[]);
+    let identity = h2_identity(&pki.trusted_client);
     for (offered, expected) in [
         (vec!["h2"], "h2"),
         (vec!["http/1.1"], "http/1.1"),
         (vec!["h2", "http/1.1"], "h2"),
     ] {
-        let (answer, selected) = https_request(
-            port,
-            &pki.ca_der,
-            Some(&pki.trusted_client),
-            &offered,
-            REQUEST,
-        )
-        .expect("the TLS handshake succeeds");
-        assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{}", answer);
-        assert_eq!(selected.as_deref(), Some(expected), "{:?}", offered);
-        println!(
-            "[R8 ALPN] offered {:?} -> selected {}; server still answers HTTP/1.1",
-            offered, expected
-        );
+        if expected == "h2" {
+            let (selected, answers) = exchange(
+                port,
+                &pki.ca_der,
+                Some(&identity),
+                vec![RequestSpec::get("/health")],
+            )
+            .expect("an h2 client completes mTLS and the h2 handshake");
+            assert_eq!(selected.as_deref(), Some(expected), "{:?}", offered);
+            assert_eq!(answers[0].status, 200);
+            assert_eq!(answers[0].body, HEALTH_BODY.as_bytes());
+            println!(
+                "[R8/R9 ALPN] offered {:?} -> selected {}; server answers HTTP/2",
+                offered, expected
+            );
+        } else {
+            let (answer, selected) = https_request(
+                port,
+                &pki.ca_der,
+                Some(&pki.trusted_client),
+                &offered,
+                REQUEST,
+            )
+            .expect("the TLS handshake succeeds");
+            assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{}", answer);
+            assert_eq!(selected.as_deref(), Some(expected), "{:?}", offered);
+            println!(
+                "[R8 ALPN] offered {:?} -> selected {}; server answers HTTP/1.1",
+                offered, expected
+            );
+        }
     }
     shutdown.store(true, Ordering::Relaxed);
 }
@@ -601,15 +631,16 @@ fn demo_server_reports_alpn_and_mtls_refusal_diagnostics() {
         ],
     );
 
-    let (answer, _) = https_request(
+    let (selected, answers) = exchange(
         server.port,
         &pki.ca_der,
-        Some(&pki.trusted_client),
-        &["h2"],
-        REQUEST,
+        Some(&h2_identity(&pki.trusted_client)),
+        vec![RequestSpec::get("/health")],
     )
-    .expect("the trusted client completes the demo server handshake");
-    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{}", answer);
+    .expect("the trusted h2 client completes the demo server handshake");
+    assert_eq!(selected.as_deref(), Some("h2"));
+    assert_eq!(answers[0].status, 200);
+    assert_eq!(answers[0].body, DEMO_HEALTH_BODY.as_bytes());
 
     let text = server
         .wait_for(|text| text.contains("\"alpn\""))
