@@ -1,4 +1,4 @@
-//! R7 keep-alive tests: two requests on one socket, `Connection: close`,
+//! Keep-alive tests: two requests on one socket, `Connection: close`,
 //! the idle timeout and the maximum in-flight connection limit.
 
 use std::io::{Read, Write};
@@ -266,7 +266,7 @@ fn the_default_limits_are_documented() {
 
 #[test]
 fn the_demo_server_keeps_the_connection_without_opr_keepalive() {
-    // Without the opt-in variable the R2 behaviour stays: every response
+    // Without the opt-in variable the default behaviour stays: every response
     // carries `Connection: close`.
     let port = free_port();
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_opurom-server"))

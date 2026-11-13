@@ -1,6 +1,6 @@
-//! R8 mutual TLS tests over real sockets: a CA-signed server chain, trusted
+//! Mutual TLS tests over real sockets: a CA-signed server chain, trusted
 //! and untrusted client certificates, a static fingerprint deny list, ALPN
-//! negotiation and the operator-facing diagnostics. R9 uses a real h2 client
+//! negotiation and the operator-facing diagnostics. The HTTP/2 suite uses a real h2 client
 //! where ALPN selects `h2`. All certificates and private keys are generated
 //! in memory with rcgen; none are checked in.
 
@@ -61,7 +61,7 @@ fn pki() -> Pki {
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params
         .distinguished_name
-        .push(DnType::CommonName, "opurom R8 test CA");
+        .push(DnType::CommonName, "opurom mTLS test CA");
     ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
     ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
     ca_params.key_usages.push(KeyUsagePurpose::CrlSign);
@@ -188,7 +188,7 @@ fn start_mtls_server(pki: &Pki, revoked: &[String]) -> (u16, Arc<std::sync::atom
     (addr.port(), shutdown)
 }
 
-/// Start the R7 single-sided TLS server with its self-signed certificate.
+/// Start the single-sided TLS server with its self-signed certificate.
 fn start_single_sided_tls_server() -> (u16, Vec<u8>, Arc<std::sync::atomic::AtomicBool>) {
     let server = Server::bind_tls(
         "127.0.0.1:0",
@@ -289,10 +289,7 @@ fn trusted_client_certificate_completes_a_real_mtls_handshake() {
     .expect("a CA-signed client certificate completes mTLS");
     assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{}", answer);
     assert!(answer.ends_with(HEALTH_BODY), "{}", answer);
-    println!(
-        "[R8 mTLS] trusted client accepted; selected ALPN: {:?}",
-        alpn
-    );
+    println!("[mTLS] trusted client accepted; selected ALPN: {:?}", alpn);
     shutdown.store(true, Ordering::Relaxed);
 }
 
@@ -308,7 +305,7 @@ fn missing_client_certificate_is_refused() {
         REQUEST,
     ));
     assert!(!err.contains("HTTP/1.1 200"), "{}", err);
-    println!("[R8 mTLS] client with no certificate refused: {}", err);
+    println!("[mTLS] client with no certificate refused: {}", err);
     shutdown.store(true, Ordering::Relaxed);
 }
 
@@ -325,7 +322,7 @@ fn untrusted_self_signed_client_certificate_is_refused() {
     ));
     assert!(!err.contains("HTTP/1.1 200"), "{}", err);
     println!(
-        "[R8 mTLS] self-signed untrusted client certificate refused: {}",
+        "[mTLS] self-signed untrusted client certificate refused: {}",
         err
     );
     shutdown.store(true, Ordering::Relaxed);
@@ -358,7 +355,7 @@ fn revoked_but_trusted_certificate_is_refused_and_a_non_revoked_one_succeeds() {
     .expect("a non-revoked CA-signed client certificate succeeds");
     assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{}", answer);
     println!(
-        "[R8 mTLS] revoked fingerprint {} refused; a non-revoked trusted certificate succeeded",
+        "[mTLS] revoked fingerprint {} refused; a non-revoked trusted certificate succeeded",
         pki.trusted_client.fingerprint
     );
     shutdown.store(true, Ordering::Relaxed);
@@ -382,7 +379,7 @@ fn revocation_ignores_a_client_supplied_fingerprint_header() {
     ));
     assert!(!err.contains("HTTP/1.1 200"), "{}", err);
     println!(
-        "[R8 mTLS] a spoofed fingerprint header did not bypass the deny list: {}",
+        "[mTLS] a spoofed fingerprint header did not bypass the deny list: {}",
         err
     );
     shutdown.store(true, Ordering::Relaxed);
@@ -411,7 +408,7 @@ fn alpn_advertises_h2_and_http_1_1_and_reports_selection() {
             assert_eq!(answers[0].status, 200);
             assert_eq!(answers[0].body, HEALTH_BODY.as_bytes());
             println!(
-                "[R8/R9 ALPN] offered {:?} -> selected {}; server answers HTTP/2",
+                "[ALPN] offered {:?} -> selected {}; server answers HTTP/2",
                 offered, expected
             );
         } else {
@@ -426,7 +423,7 @@ fn alpn_advertises_h2_and_http_1_1_and_reports_selection() {
             assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{}", answer);
             assert_eq!(selected.as_deref(), Some(expected), "{:?}", offered);
             println!(
-                "[R8 ALPN] offered {:?} -> selected {}; server answers HTTP/1.1",
+                "[ALPN] offered {:?} -> selected {}; server answers HTTP/1.1",
                 offered, expected
             );
         }
@@ -438,7 +435,7 @@ fn alpn_advertises_h2_and_http_1_1_and_reports_selection() {
 fn single_sided_tls_without_alpn_stays_byte_identical() {
     let (port, certificate_der, shutdown) = start_single_sided_tls_server();
     let (answer, alpn) = https_request(port, &certificate_der, None, &[], REQUEST)
-        .expect("R7 single-sided TLS still accepts a client with no certificate");
+        .expect("single-sided TLS still accepts a client with no certificate");
     let expected = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         HEALTH_BODY.len(),
@@ -446,7 +443,7 @@ fn single_sided_tls_without_alpn_stays_byte_identical() {
     );
     assert_eq!(answer, expected);
     assert_eq!(alpn, None);
-    println!("[R8] single-sided TLS with no ALPN: byte-identical HTTP/1.1 answer");
+    println!("[TLS] single-sided TLS with no ALPN: byte-identical HTTP/1.1 answer");
     shutdown.store(true, Ordering::Relaxed);
 }
 
@@ -606,7 +603,7 @@ fn opr_mtls_alone_enables_tls_and_requires_a_client_certificate() {
     assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{}", answer);
     let err = refused(https_request(server.port, &pki.ca_der, None, &[], REQUEST));
     println!(
-        "[R8 mTLS] OPR_MTLS alone enabled TLS; no-certificate client refused: {}",
+        "[mTLS] OPR_MTLS alone enabled TLS; no-certificate client refused: {}",
         err
     );
 }
@@ -657,7 +654,7 @@ fn demo_server_reports_alpn_and_mtls_refusal_diagnostics() {
     assert_eq!(value["method"], "GET");
     assert_eq!(value["path"], "/health");
     assert_eq!(value["status"], 200);
-    println!("[R8 structured log] {}", line);
+    println!("[structured log] {}", line);
 
     let missing = refused(https_request(
         server.port,
@@ -670,7 +667,7 @@ fn demo_server_reports_alpn_and_mtls_refusal_diagnostics() {
         .wait_for(|text| text.matches("mTLS handshake refused").count() >= 1)
         .expect("a missing certificate writes a clear diagnostic");
     assert!(text.contains("OPR_CLIENT_CA"), "{}", text);
-    println!("[R8 mTLS] missing certificate diagnostic: {}", missing);
+    println!("[mTLS] missing certificate diagnostic: {}", missing);
 
     let untrusted = refused(https_request(
         server.port,
@@ -683,5 +680,5 @@ fn demo_server_reports_alpn_and_mtls_refusal_diagnostics() {
         .wait_for(|text| text.matches("mTLS handshake refused").count() >= 2)
         .expect("an untrusted certificate writes a clear diagnostic");
     assert!(text.contains("client certificate"), "{}", text);
-    println!("[R8 mTLS] untrusted certificate diagnostic: {}", untrusted);
+    println!("[mTLS] untrusted certificate diagnostic: {}", untrusted);
 }

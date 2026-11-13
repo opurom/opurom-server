@@ -1,4 +1,4 @@
-//! Ordered middleware chain, request logging, rate limiting and R5 HTTP options.
+//! Ordered middleware chain, request logging, rate limiting and HTTP options.
 //!
 //! A middleware is a boxed closure applied to every request before routing.
 //! Returning `Some(response)` short-circuits the request (for example the
@@ -161,7 +161,7 @@ pub fn default_body_cap() -> Middleware {
 /// after [`RATE_LIMIT_WINDOW_SECS`]. It is deterministic for a given `Instant`
 /// and is shared through a Mutex across server threads.
 // shortcut: keys use the received path, not the router pattern, and counters
-// are process-local; R6+ needs matched-pattern keys and a distributed store.
+// are process-local; a distributed store needs matched-pattern keys.
 pub struct RateLimiter {
     limit: u64,
     start: Instant,
@@ -236,7 +236,7 @@ pub fn rate_limit_from_env() -> Option<Middleware> {
     RateLimiter::from_env().map(|limiter| rate_limit_with(Arc::new(limiter)))
 }
 
-/// R5 HTTP options captured once when a `Server` binds.
+/// HTTP options captured once when a `Server` binds.
 #[derive(Clone, Debug, Default)]
 pub struct HttpOptions {
     pub auth_token: Option<String>,
@@ -245,7 +245,7 @@ pub struct HttpOptions {
 }
 
 impl HttpOptions {
-    /// Read R5 options from the environment. Any R5 opt-in variable enables
+    /// Read the HTTP options from the environment. Any opt-in variable enables
     /// ETags; `OPR_ETAG` can also enable or explicitly disable them alone.
     pub fn from_env() -> HttpOptions {
         let auth_token = std::env::var(AUTH_TOKEN_ENV)
@@ -267,7 +267,8 @@ impl HttpOptions {
 }
 
 /// Compare bytes without an early exit on the first differing byte.
-// shortcut: length remains visible in timing; R6+ needs a production identity provider.
+// shortcut: length remains visible in timing; a production identity provider
+// compares digests instead.
 pub fn constant_time_eq(expected: &[u8], provided: &[u8]) -> bool {
     let mut difference = expected.len() ^ provided.len();
     for index in 0..expected.len().max(provided.len()) {
@@ -409,7 +410,7 @@ pub fn gzip_body(body: &[u8]) -> std::io::Result<Vec<u8>> {
     encoder.finish()
 }
 
-/// Apply the opt-in R5 response features to a completed response.
+/// Apply the opt-in HTTP response features to a completed response.
 pub fn apply_response_features(response: &mut Response, request: &Request, options: &HttpOptions) {
     if let Some(origin) = options.cors_origin.as_deref() {
         if !has_header(response, "Access-Control-Allow-Origin") {

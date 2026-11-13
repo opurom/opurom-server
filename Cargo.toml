@@ -3,7 +3,7 @@ name = "opurom-server"
 version = "0.2.0"
 edition = "2021"
 publish = false
-description = "OPUROM R2/R4/R5/R7/R8/R9/R10 backend runtime: HTTP/1.1, HTTP/2, routing, fault isolation, SSR host, opt-in hardening, certificate status and service lowering"
+description = "OPUROM backend runtime: HTTP/1.1, HTTP/2, routing, fault isolation, SSR host, opt-in hardening, certificate status and service lowering"
 
 [lib]
 name = "opurom_server"
@@ -21,7 +21,7 @@ path = "src/bin/opurom-serverc.rs"
 flate2 = "1.1.11"
 serde_json = "1.0.154"
 
-# R7 transport dependencies, pinned exactly.
+# Transport dependencies, pinned exactly.
 # rustls: the TLS 1.2/1.3 implementation of the optional HTTPS listener.
 # rustls-pemfile: reading the PEM certificate and private key files.
 # rcgen: generating the self-signed certificate when no PEM file is given.
@@ -37,7 +37,7 @@ sha1 = "=0.10.6"
 base64 = "=0.23.1"
 getrandom = "=0.2.17"
 
-# R9 HTTP/2 dependencies, pinned exactly.
+# HTTP/2 dependencies, pinned exactly.
 # h2: HEADERS/DATA frames, HPACK, streams, flow control and GOAWAY.
 # http/bytes: the request and response types used by the h2 API.
 # tokio: the async runtime and socket used only by negotiated TLS connections.
@@ -48,6 +48,6 @@ bytes = "=1.12.1"
 tokio = { version = "=1.54.1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 
-# R10 certificate status dependency, pinned exactly.
+# Certificate status dependency, pinned exactly.
 # x509-parser: DER X.509/CRL parsing and CA signature verification.
 x509-parser = { version = "=0.18.1", features = ["verify"] }

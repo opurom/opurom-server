@@ -1,20 +1,21 @@
 //! Thread-per-connection HTTP/1.1 server over `std::net::TcpListener`.
 //!
 //! The listener serves plain HTTP by default and every default response byte
-//! stays identical to R6. Three opt-in features change that:
+//! stays identical to the plain-HTTP default. Three opt-in features change that:
 //!
 //! * `OPR_TLS=1` serves HTTPS on the same bind address.
 //! * `OPR_KEEPALIVE=1` reuses a connection for several HTTP/1.1 requests.
 //! * `OPR_WEBSOCKET=1` accepts RFC 6455 upgrades.
 //!
-//! R8 adds opt-in `OPR_MTLS=1` client certificates, the `OPR_REVOKED` static
-//! fingerprint deny list and ALPN reporting. R9 serves real HTTP/2 when ALPN
-//! selects `h2`; every other connection keeps the HTTP/1.1 path. R10 adds
-//! required static local DER CRL/OCSP status sources to the mTLS handshake.
-//! No new environment variable enables HTTP/2.
+//! `OPR_MTLS=1` adds opt-in client certificates, the `OPR_REVOKED` static
+//! fingerprint deny list and ALPN reporting. HTTP/2 is served when ALPN
+//! selects `h2`; every other connection keeps the HTTP/1.1 path. The
+//! `OPR_CRL_FILE` and `OPR_OCSP_FILE` variables add required static local DER
+//! CRL/OCSP status sources to the mTLS handshake. No new environment variable
+//! enables HTTP/2.
 //!
-//! With none of the R8 variables set, no client ALPN offer and no `h2`
-//! negotiation, the R7 wire format and response bytes stay identical.
+//! With none of the mTLS variables set, no client ALPN offer and no `h2`
+//! negotiation, the plain-TLS wire format and response bytes stay identical.
 //!
 //! Connections are bounded by an idle timeout and a maximum number of
 //! in-flight connections.
@@ -507,7 +508,7 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
     }
 }
 
-/// Apply the existing middleware, rate limiter, router and R5 features to one
+/// Apply the existing middleware, rate limiter, router and HTTP features to one
 /// request. HTTP/1.1 and HTTP/2 share this conversion point.
 pub(crate) fn dispatch_request(
     request: &mut Request,
@@ -557,14 +558,14 @@ fn wants_keep_alive(request: &Request) -> bool {
     true
 }
 
-/// Write the response and close the connection. This is the R2 wire format
-/// and stays byte-identical.
+/// Write the response and close the connection. This is the plain HTTP/1.1 wire
+/// format and stays byte-identical.
 pub fn write_response<W: Write>(writer: &mut W, response: &Response) -> std::io::Result<()> {
     write_response_with(writer, response, false)
 }
 
 /// Write the response. With `keep_alive` the answer carries
-/// `Connection: keep-alive`, otherwise `Connection: close` as in R2.
+/// `Connection: keep-alive`, otherwise `Connection: close`.
 pub fn write_response_with<W: Write>(
     writer: &mut W,
     response: &Response,

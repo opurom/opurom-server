@@ -1,4 +1,4 @@
-//! R10 certificate-status tests over real mTLS sockets. All status fixtures
+//! Certificate-status tests over real mTLS sockets. All status fixtures
 //! are generated in memory by rcgen; the required sources are in-memory DER
 //! bytes or local DER files under this crate's ignored `target/` directory.
 //! No live OCSP responder is contacted and no private key is checked in.
@@ -141,7 +141,7 @@ impl TempDir {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join(format!(
-                "opurom-server-r10-{}-{}-{}",
+                "opurom-server-cert-status-{}-{}-{}",
                 tag,
                 std::process::id(),
                 NONCE.fetch_add(1, Ordering::Relaxed)
@@ -171,7 +171,7 @@ fn crl_revoked_serial_is_refused_and_good_client_is_accepted() {
     assert!(!err.contains("HTTP/1.1 200"), "{}", err);
     accepted(https_request(port, &pki.ca_der, &pki.other));
     println!(
-        "[R10 CRL] revoked serial refused; a non-revoked trusted serial accepted: {}",
+        "[CRL] revoked serial refused; a non-revoked trusted serial accepted: {}",
         err
     );
     shutdown.store(true, Ordering::Relaxed);
@@ -187,7 +187,7 @@ fn crl_stale_or_tampered_der_fails_closed() {
         let (port, shutdown) = start_server(pki, Some(crl_source(der)), None);
         let err = refused(https_request(port, &pki.ca_der, &pki.trusted));
         assert!(!err.contains("HTTP/1.1 200"), "{}", err);
-        println!("[R10 CRL] {} failed closed: {}", label, err);
+        println!("[CRL] {} failed closed: {}", label, err);
         shutdown.store(true, Ordering::Relaxed);
     }
 }
@@ -202,7 +202,7 @@ fn crl_malformed_or_oversized_der_fails_closed() {
         let (port, shutdown) = start_server(pki, Some(crl_source(der)), None);
         let err = refused(https_request(port, &pki.ca_der, &pki.trusted));
         assert!(!err.contains("HTTP/1.1 200"), "{}", err);
-        println!("[R10 CRL] {} DER failed closed: {}", label, err);
+        println!("[CRL] {} DER failed closed: {}", label, err);
         shutdown.store(true, Ordering::Relaxed);
     }
 }
@@ -219,7 +219,7 @@ fn ocsp_good_status_is_accepted_and_revoked_status_is_refused() {
         start_server(pki, None, Some(ocsp_source(pki.ocsp_revoked.clone())));
     let err = refused(https_request(bad_port, &pki.ca_der, &pki.trusted));
     assert!(!err.contains("HTTP/1.1 200"), "{}", err);
-    println!("[R10 OCSP] good accepted; revoked refused: {}", err);
+    println!("[OCSP] good accepted; revoked refused: {}", err);
     bad_shutdown.store(true, Ordering::Relaxed);
 }
 
@@ -233,7 +233,7 @@ fn ocsp_unknown_and_wrong_serial_fail_closed() {
         let (port, shutdown) = start_server(pki, None, Some(ocsp_source(der)));
         let err = refused(https_request(port, &pki.ca_der, &pki.trusted));
         assert!(!err.contains("HTTP/1.1 200"), "{}", err);
-        println!("[R10 OCSP] {} failed closed: {}", label, err);
+        println!("[OCSP] {} failed closed: {}", label, err);
         shutdown.store(true, Ordering::Relaxed);
     }
 }
@@ -248,7 +248,7 @@ fn ocsp_stale_or_tampered_response_fails_closed() {
         let (port, shutdown) = start_server(pki, None, Some(ocsp_source(der)));
         let err = refused(https_request(port, &pki.ca_der, &pki.trusted));
         assert!(!err.contains("HTTP/1.1 200"), "{}", err);
-        println!("[R10 OCSP] {} failed closed: {}", label, err);
+        println!("[OCSP] {} failed closed: {}", label, err);
         shutdown.store(true, Ordering::Relaxed);
     }
 }
@@ -260,7 +260,7 @@ fn ocsp_empty_env_value_fails_closed() {
     let (port, shutdown) = start_server(pki, None, Some(source));
     let err = refused(https_request(port, &pki.ca_der, &pki.trusted));
     assert!(!err.contains("HTTP/1.1 200"), "{}", err);
-    println!("[R10 OCSP] empty required source failed closed: {}", err);
+    println!("[OCSP] empty required source failed closed: {}", err);
     shutdown.store(true, Ordering::Relaxed);
 }
 
@@ -284,7 +284,7 @@ fn ocsp_unavailable_or_malformed_file_fails_closed() {
     let oversized = refused(https_request(port, &pki.ca_der, &pki.trusted));
 
     println!(
-        "[R10 OCSP] missing={}, unavailable={}, malformed={}, oversized={}",
+        "[OCSP] missing={}, unavailable={}, malformed={}, oversized={}",
         missing, unavailable, malformed, oversized
     );
     shutdown.store(true, Ordering::Relaxed);
@@ -320,27 +320,24 @@ fn crl_and_ocsp_sources_are_both_required() {
         } else {
             let err = refused(result);
             assert!(!err.contains("HTTP/1.1 200"), "{}", err);
-            println!(
-                "[R10 status] {} refused when both sources are required",
-                label
-            );
+            println!("[status] {} refused when both sources are required", label);
         }
         shutdown.store(true, Ordering::Relaxed);
     }
 }
 
 #[test]
-fn r9_mtls_response_bytes_are_identical_without_status_sources() {
+fn mtls_response_bytes_are_identical_without_status_sources() {
     let pki = shared_fixture();
     let (port, shutdown) = start_server(pki, None, None);
     let answer = https_request(port, &pki.ca_der, &pki.trusted)
-        .expect("R9 mTLS still accepts a trusted client");
+        .expect("mTLS still accepts a trusted client");
     let expected = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         HEALTH_BODY.len(),
         HEALTH_BODY
     );
     assert_eq!(answer, expected);
-    println!("[R10 status] no status sources: byte-identical R9 mTLS answer");
+    println!("[status] no status sources: byte-identical mTLS answer");
     shutdown.store(true, Ordering::Relaxed);
 }

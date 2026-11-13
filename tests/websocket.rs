@@ -1,4 +1,4 @@
-//! R7 WebSocket tests: the RFC 6455 handshake, text and binary frames,
+//! WebSocket tests: the RFC 6455 handshake, text and binary frames,
 //! ping/pong, close frames and fragmentation, all over a real socket.
 
 use std::io::{Read, Write};

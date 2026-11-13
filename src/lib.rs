@@ -1,4 +1,4 @@
-//! OPUROM R2/R4/R5/R7/R8/R9/R10 backend runtime.
+//! OPUROM backend runtime.
 //!
 //! The library uses `serde_json` for IR and JSON responses and `flate2` for
 //! opt-in gzip. It provides:
@@ -6,7 +6,7 @@
 //! * [`http`] - HTTP/1.1 request/response types and a bounded parser.
 //! * [`http2`] - real HTTP/2 frames over an ALPN-selected TLS connection.
 //! * [`router`] - literal and `:param` routing with per-route fault isolation.
-//! * [`middleware`] - middleware, rate limiting, logs and opt-in R5 features.
+//! * [`middleware`] - middleware, rate limiting, logs and opt-in HTTP features.
 //! * [`server`] - a thread-per-connection `TcpListener` server with optional
 //!   TLS, ALPN-selected HTTP/2 and HTTP/1.1 keep-alive.
 //! * [`tls`] - the optional TLS listener with a self-signed fallback, opt-in
@@ -30,7 +30,7 @@ pub mod ssr;
 pub mod tls;
 pub mod websocket;
 
-pub use codegen::lower_service;
+pub use codegen::{default_dep_root, lower_service};
 pub use http::{Method, Request, Response, MAX_BODY_BYTES};
 pub use http2::{
     INITIAL_WINDOW_SIZE, MAX_CONCURRENT_STREAMS, MAX_FRAME_SIZE, MAX_HEADER_LIST_SIZE,

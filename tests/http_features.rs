@@ -1,4 +1,4 @@
-//! R5 opt-in HTTP features over real TCP: auth, gzip, ETag, CORS and defaults.
+//! Opt-in HTTP features over real TCP: auth, gzip, ETag, CORS and defaults.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -33,13 +33,13 @@ impl DemoServer {
         let port = free_port();
         let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
         let stderr_path = std::env::temp_dir().join(format!(
-            "opurom-server-r5-{}-{}-{}.stderr",
+            "opurom-server-http-features-{}-{}-{}.stderr",
             tag,
             std::process::id(),
             nonce
         ));
         let stdout_path = std::env::temp_dir().join(format!(
-            "opurom-server-r5-{}-{}-{}.stdout",
+            "opurom-server-http-features-{}-{}-{}.stdout",
             tag,
             std::process::id(),
             nonce
@@ -354,7 +354,7 @@ fn bearer_auth_rejects_missing_and_wrong_tokens() {
     ));
     assert_eq!(valid.status(), 200);
     assert_eq!(valid.body_str(), HEALTH_BODY);
-    let etag = valid.header("ETag").expect("R5 auth env enables ETag");
+    let etag = valid.header("ETag").expect("the auth env enables ETag");
     assert_eq!(etag, etag_for(&valid.body).as_str());
     assert_eq!(valid.header_count("ETag"), 1);
 
@@ -618,7 +618,7 @@ fn cors_uses_fixed_origin_and_preflight_is_204() {
         None,
         "preflight-only header"
     );
-    let etag = get.header("ETag").expect("R5 CORS env enables ETag");
+    let etag = get.header("ETag").expect("the CORS env enables ETag");
 
     let conditional = Answer::parse(&raw_request(
         server.port,
@@ -724,7 +724,7 @@ fn cors_wildcard_is_literal_and_invalid_config_is_disabled() {
 }
 
 #[test]
-fn all_r5_features_compose_on_large_json() {
+fn all_http_features_compose_on_large_json() {
     let server = DemoServer::spawn(
         "all-features",
         &[
@@ -871,7 +871,7 @@ fn preflight_bypasses_auth_but_counts_and_logs() {
 }
 
 #[test]
-fn default_behaviour_is_byte_identical_without_r5_env() {
+fn default_behaviour_is_byte_identical_without_http_env() {
     let server = DemoServer::spawn("default", &[]);
     let expected = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

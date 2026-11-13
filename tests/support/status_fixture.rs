@@ -1,4 +1,4 @@
-//! In-memory R10 certificate-status fixtures. Every key and certificate is
+//! In-memory certificate-status fixtures. Every key and certificate is
 //! generated with rcgen at test runtime; no private key is checked in. CRLs
 //! are DER produced by rcgen, OCSP responses are DER BasicOCSPResponse values
 //! signed by the generated CA key. No responder is contacted.
@@ -72,7 +72,7 @@ pub fn fixture() -> Fixture {
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params
         .distinguished_name
-        .push(DnType::CommonName, "opurom R10 status test CA");
+        .push(DnType::CommonName, "opurom status test CA");
     ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
     ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
     ca_params.key_usages.push(KeyUsagePurpose::CrlSign);

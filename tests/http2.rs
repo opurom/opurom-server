@@ -1,4 +1,4 @@
-//! R9 HTTP/2 tests over the real TLS listener: concurrent h2 client streams,
+//! HTTP/2 tests over the real TLS listener: concurrent h2 client streams,
 //! request/response flow control, stream isolation and graceful GOAWAY.
 
 mod support;
@@ -208,7 +208,7 @@ fn h2_concurrent_streams_share_one_tls_connection() {
     );
     assert_eq!(answers[4].body, b"{\"error\":\"blocked\"}");
     println!(
-        "[R9 h2] one TLS connection, {} concurrent streams: GET /health=200, GET /items/42=200, POST /echo=200, OPTIONS /health=204, GET /blocked=418; ALPN=h2",
+        "[h2] one TLS connection, {} concurrent streams: GET /health=200, GET /items/42=200, POST /echo=200, OPTIONS /health=204, GET /blocked=418; ALPN=h2",
         answers.len()
     );
 }
@@ -240,7 +240,7 @@ fn h2_large_body_flow_control_isolates_failed_stream() {
     assert_eq!(answers[2].body, posted);
     assert_eq!(answers[3].body, b"{\"ok\":true}");
     println!(
-        "[R9 h2] {} KiB response and {} KiB request crossed flow-control windows; GET /large=200, GET /panic=500, POST /echo=200, GET /health=200 on one connection",
+        "[h2] {} KiB response and {} KiB request crossed flow-control windows; GET /large=200, GET /panic=500, POST /echo=200, GET /health=200 on one connection",
         LARGE_BODY_BYTES / 1024,
         LARGE_REQUEST_BYTES / 1024
     );
@@ -331,7 +331,7 @@ fn h2_shutdown_sends_graceful_goaway() {
             assert!(initial_goaway, "the final GOAWAY follows the initial one");
             assert_eq!(last_stream_id, 0);
             println!(
-                "[R9 h2] shutdown sent initial GOAWAY(last_stream_id=2^31-1, NO_ERROR), accepted PING ACK, then final GOAWAY(last_stream_id=0, NO_ERROR)"
+                "[h2] shutdown sent initial GOAWAY(last_stream_id=2^31-1, NO_ERROR), accepted PING ACK, then final GOAWAY(last_stream_id=0, NO_ERROR)"
             );
             return;
         }

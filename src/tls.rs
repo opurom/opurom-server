@@ -11,12 +11,13 @@
 //! comma-separated SHA-256 fingerprint deny list. `OPR_CRL_FILE` and
 //! `OPR_OCSP_FILE` add required static local DER status sources; both are
 //! checked on every mTLS handshake and fail closed when unusable. Both TLS
-//! modes advertise `h2` and `http/1.1` through ALPN; R9 serves real HTTP/2
-//! frames when `h2` is selected.
+//! modes advertise `h2` and `http/1.1` through ALPN; real HTTP/2 frames are
+//! served when `h2` is selected.
 //!
-//! Honest scope: no live OCSP responder fetch or CRL distribution point, no
-//! certificate transparency, no distributed revocation, no HSM and no
-//! cipher-suite tuning beyond the library defaults.
+//! The status sources are local files that are read at every handshake. There
+//! is no live OCSP responder fetch, no CRL distribution point and no
+//! certificate transparency; the cipher suites and protocol versions are the
+//! library defaults.
 
 use std::collections::BTreeSet;
 use std::fmt;

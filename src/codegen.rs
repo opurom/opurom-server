@@ -12,9 +12,54 @@ use serde_json::Value;
 
 use crate::ir::{Api, FieldType, Ir, Model};
 
-/// Default workspace root that holds the sibling `opurom-server` and
+/// Resolve the workspace root that holds the sibling `opurom-server` and
 /// `opurom-db` crates.
-pub const DEFAULT_DEP_ROOT: &str = "/Users/mac/work/opurom";
+///
+/// Nothing is hard-coded: the nearest ancestor of the working directory that
+/// contains both sibling crates wins, then the nearest ancestor of the running
+/// executable, then the parent of this crate's own manifest directory. The
+/// `--dep-root` command-line override takes precedence over all of them.
+pub fn default_dep_root() -> Result<PathBuf, String> {
+    let mut starts: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        starts.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            starts.push(dir.to_path_buf());
+        }
+    }
+    starts.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    );
+
+    for start in &starts {
+        if let Some(root) = workspace_root(start) {
+            return Ok(root);
+        }
+    }
+    Err(
+        "cannot find a workspace with the sibling opurom-server and opurom-db crates; \
+         run opurom-serverc inside the workspace or pass --dep-root <path>"
+            .to_string(),
+    )
+}
+
+/// The nearest ancestor of `start` that holds both sibling crates.
+fn workspace_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        if dir.join("opurom-server").is_dir() && dir.join("opurom-db").is_dir() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
 
 /// Result of a lowering run: the files written and the crate root.
 #[derive(Clone, Debug)]
@@ -843,18 +888,18 @@ fn readme(ir: &Ir) -> String {
     out.push_str("* `OPR_DB` - SQLite database path (default `./opurom.db`)\n");
     out.push_str("* `OPR_RATE_LIMIT` - optional positive integer requests per method and path per 60-second window; excess requests get `429` JSON and `Retry-After` seconds\n");
     out.push_str("* `OPR_LOG_JSON=1` - one JSON line per request to stderr with `method`, `path`, `status` and measured `elapsed_ms`; TLS connections that negotiated ALPN also report `alpn`\n");
-    out.push_str("* `OPR_AUTH_TOKEN` - optional development bearer token; missing or mismatched tokens get `401 {\"error\":\"unauthorized\"}`. This is not a production identity system\n");
+    out.push_str("* `OPR_AUTH_TOKEN` - optional development bearer token; missing or mismatched tokens get `401 {\"error\":\"unauthorized\"}`\n");
     out.push_str("* `OPR_CORS` - one fixed `http://` or `https://` origin (or the literal `*`); adds CORS headers and answers `OPTIONS` preflight with `204`\n");
-    out.push_str("* `OPR_ETAG=1` - enables ETags alone; any R5 opt-in variable also enables them. `If-None-Match` on GET can answer `304` with no body\n");
+    out.push_str("* `OPR_ETAG=1` - enables ETags alone; any other opt-in HTTP variable also enables them. `If-None-Match` on GET can answer `304` with no body\n");
     out.push_str("* `Accept-Encoding: gzip` - request-opt-in gzip for response bodies larger than 1024 bytes; small bodies stay unchanged\n");
     out.push_str("* `OPR_TLS=1` - serves HTTPS on the same address; `OPR_TLS_CERT` and `OPR_TLS_KEY` point at PEM files, and without them a self-signed certificate is generated at startup\n");
     out.push_str("* `OPR_KEEPALIVE=1` - reuses one connection for several HTTP/1.1 requests; `Connection: close` still ends the connection\n");
     out.push_str("* `OPR_WEBSOCKET=1` - accepts RFC 6455 WebSocket upgrades\n");
     out.push_str("* `OPR_MTLS=1` - requires a client certificate signed by `OPR_CLIENT_CA` (a client CA PEM path or inline PEM); also enables TLS\n");
-    out.push_str("* `OPR_REVOKED` - static comma-separated SHA-256 certificate fingerprint deny list, active only with `OPR_MTLS=1`; NOT OCSP or a distributed CRL\n");
+    out.push_str("* `OPR_REVOKED` - static comma-separated SHA-256 certificate fingerprint deny list, active only with `OPR_MTLS=1`\n");
     out.push_str("* `OPR_CRL_FILE` - required static local DER X.509 v2 CRL, active only with `OPR_MTLS=1`; a missing, malformed, stale or unverifiable CRL refuses the handshake\n");
-    out.push_str("* `OPR_OCSP_FILE` - required static local DER BasicOCSPResponse, active only with `OPR_MTLS=1`; good/revoked/unknown statuses, CA signature and freshness are checked; no live responder fetch\n\n");
-    out.push_str("The service opens one `PooledDb` at startup and shares its Mutex-serialized SQLite connection across all handlers. With no optional hardening env vars and no gzip request header, HTTP responses and stdout stay byte-identical. R4 env vars do not enable R5 features.\n\n");
+    out.push_str("* `OPR_OCSP_FILE` - required static local DER BasicOCSPResponse, active only with `OPR_MTLS=1`; good/revoked/unknown statuses, CA signature and freshness are checked\n\n");
+    out.push_str("The service opens one `PooledDb` at startup and shares its Mutex-serialized SQLite connection across all handlers. With no optional hardening env vars and no gzip request header, HTTP responses and stdout stay byte-identical. The rate-limit and log variables never enable the opt-in HTTP response features.\n\n");
     out.push_str("The schema is created at startup from the embedded `migrations/*.sql`.\n\n");
     out.push_str("## Routes\n\n");
     out.push_str("* `GET /health` - `{\"ok\":true,\"app\":\"...\",\"version\":\"0.2.0\"}`\n");
@@ -877,7 +922,7 @@ fn readme(ir: &Ir) -> String {
             let _ = writeln!(out, "* `{} {}{}`", method, api.path, suffix);
         }
     }
-    out.push_str("\n## Honest status\n\n");
-    out.push_str("One shared Mutex-guarded SQLite connection is not a sized connection pool. Rate limiting is a process-local fixed window, not a distributed rate limit. The bearer token is a development check, not a real auth provider. TLS has no client-certificate mTLS, no OCSP/CRL and no certificate revocation, and the WebSocket subset has no permessage-deflate. R8+: production identity, real connection pool sizing, distributed rate limiting, HTTP/2 and HTTP/3, streaming, compression dictionaries.\n");
+    out.push_str("\n## Runtime model\n\n");
+    out.push_str("One shared Mutex-guarded SQLite connection serves every handler. Rate limiting is a process-local fixed window. The bearer token is a development check. TLS terminates on the listener, and the optional client-certificate handshake checks the configured status sources.\n");
     out
 }

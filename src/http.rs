@@ -11,7 +11,7 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Maximum accepted header block size. Larger header blocks get a 431.
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 
-/// HTTP methods supported by the R2 contract.
+/// HTTP methods supported by the server contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Method {
     Get,

@@ -7,8 +7,8 @@
 //! server never sends masked frames and always requires masked client
 //! frames, exactly as RFC 6455 section 5.1 demands.
 //!
-//! Honest scope: no `permessage-deflate`, no extensions, no subprotocol
-//! negotiation and no client certificates over the WebSocket.
+//! The implementation negotiates no `permessage-deflate`, no extensions and no
+//! subprotocol, and it accepts no client certificates over the WebSocket.
 
 use std::io::{self, Read, Write};
 

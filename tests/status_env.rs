@@ -1,4 +1,4 @@
-//! R10 environment-variable integration for `OPR_CRL_FILE` and
+//! Environment-variable integration for `OPR_CRL_FILE` and
 //! `OPR_OCSP_FILE`. All PEM and DER files are generated inside this crate's
 //! ignored `target/` directory at test runtime and removed afterwards.
 
@@ -208,7 +208,7 @@ fn crl_and_ocsp_env_files_configure_mtls() {
     let missing_crl = refused(https_request(port, &pki.ca_der, &pki.trusted));
 
     println!(
-        "[R10 env] both local files accepted; missing OCSP={}, missing CRL={}",
+        "[env] both local files accepted; missing OCSP={}, missing CRL={}",
         missing_ocsp, missing_crl
     );
     shutdown.store(true, Ordering::Relaxed);

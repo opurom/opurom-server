@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use opurom_server::codegen::lower_service;
+use opurom_server::codegen::{default_dep_root, lower_service};
 
 const IR: &str = r##"{
   "ir": "0.1",
@@ -171,9 +171,50 @@ fn lowering_shares_one_pooled_database() {
     assert!(readme.contains("OPR_CORS"), "{}", readme);
     assert!(readme.contains("OPR_ETAG"), "{}", readme);
     assert!(readme.contains("Accept-Encoding: gzip"), "{}", readme);
-    assert!(readme.contains("not a sized connection pool"), "{}", readme);
+    assert!(
+        readme.contains("Mutex-guarded SQLite connection"),
+        "{}",
+        readme
+    );
     assert!(readme.contains("OPR_TLS"), "{}", readme);
     assert!(readme.contains("OPR_KEEPALIVE"), "{}", readme);
     assert!(readme.contains("OPR_WEBSOCKET"), "{}", readme);
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn the_default_dep_root_is_resolved_at_runtime() {
+    let root = default_dep_root().expect("the workspace root is discovered");
+    assert!(root.is_absolute(), "{}", root.display());
+    assert!(root.join("opurom-server").is_dir(), "{}", root.display());
+    assert!(root.join("opurom-db").is_dir(), "{}", root.display());
+    // The resolved root is the workspace that holds this very crate, so it is
+    // an ancestor of the manifest directory.
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        manifest_dir.starts_with(&root),
+        "{} is not under {}",
+        manifest_dir.display(),
+        root.display()
+    );
+}
+
+#[test]
+fn the_generated_readme_names_no_round_codename() {
+    let out = temp_dir("readme-wording");
+    lower_service(IR, &out, &PathBuf::from("/tmp/dep-root")).expect("lowering works");
+    let readme = fs::read_to_string(out.join("README.md")).expect("README.md exists");
+    for needle in [
+        "the async language layer",
+        "the GPU and transport layer",
+        "the native network layer",
+        "the visual fidelity layer",
+        "the production layer",
+        "the component library hardening",
+        "the integration layer",
+        "Honest",
+    ] {
+        assert!(!readme.contains(needle), "{} in\n{}", needle, readme);
+    }
     let _ = fs::remove_dir_all(&out);
 }

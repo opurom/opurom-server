@@ -40,6 +40,9 @@ crate keeps the generated service compiling.
 ## Connection model
 
 `Sqlite` holds a raw pointer and is therefore not `Send`. The generated service
-opens one connection per request instead of sharing a handle; this avoids
-`unsafe impl Send` in the sibling crate and keeps the fault-isolation
-guarantee intact. Connection pooling is R3+ work.
+opens one `PooledDb` at startup and shares it across the handlers. `PooledDb`
+is `Arc<Mutex<Sqlite>>`, and the sibling crate provides the justified
+`unsafe impl Send` and `unsafe impl Sync` under that invariant: every FFI call
+holds the Mutex for the whole `&mut Sqlite` borrow. One shared
+Mutex-serialized connection serves every request; the fault-isolation
+guarantee is unchanged.

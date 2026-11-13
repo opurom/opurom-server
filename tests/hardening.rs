@@ -1,4 +1,4 @@
-//! R4 hardening tests: rate limits, structured logs and unchanged defaults.
+//! Hardening tests: rate limits, structured logs and unchanged defaults.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
