@@ -12,17 +12,17 @@ an HTTP CRL distribution point with a refreshable cache, and
 Rust service crate.
 
 This crate implements the backend half of
-[`FULLSTACK_SPEC.md`](../opurom-spec/FULLSTACK_SPEC.md) sections 4-5,
-[`TOOLCHAIN_AND_PACKAGES.md`](../opurom-spec/TOOLCHAIN_AND_PACKAGES.md)
+[`FULLSTACK_SPEC.md`](https://github.com/opurom/opurom-spec/blob/main/FULLSTACK_SPEC.md) sections 4-5,
+[`TOOLCHAIN_AND_PACKAGES.md`](https://github.com/opurom/opurom-spec/blob/main/TOOLCHAIN_AND_PACKAGES.md)
 section 6,
-[`GPU_WINDOW_TRANSPORT.md`](../opurom-spec/GPU_WINDOW_TRANSPORT.md) section 6,
-[`NATIVE_NETWORK.md`](../opurom-spec/NATIVE_NETWORK.md) sections 1 and 5,
-[`BROWSER_AND_NATIVE_SURFACES.md`](../opurom-spec/BROWSER_AND_NATIVE_SURFACES.md)
+[`GPU_WINDOW_TRANSPORT.md`](https://github.com/opurom/opurom-spec/blob/main/GPU_WINDOW_TRANSPORT.md) section 6,
+[`NATIVE_NETWORK.md`](https://github.com/opurom/opurom-spec/blob/main/NATIVE_NETWORK.md) sections 1 and 5,
+[`BROWSER_AND_NATIVE_SURFACES.md`](https://github.com/opurom/opurom-spec/blob/main/BROWSER_AND_NATIVE_SURFACES.md)
 section 4,
-[`PRODUCTION_BREADTH.md`](../opurom-spec/PRODUCTION_BREADTH.md) section 2,
-[`COMPONENT_LIBRARY_HARDENING.md`](../opurom-spec/COMPONENT_LIBRARY_HARDENING.md)
+[`PRODUCTION_BREADTH.md`](https://github.com/opurom/opurom-spec/blob/main/PRODUCTION_BREADTH.md) section 2,
+[`COMPONENT_LIBRARY_HARDENING.md`](https://github.com/opurom/opurom-spec/blob/main/COMPONENT_LIBRARY_HARDENING.md)
 section 5 and
-[`TRANSPORT_AND_LANGUAGE_ADDITIONS.md`](../opurom-spec/TRANSPORT_AND_LANGUAGE_ADDITIONS.md)
+[`TRANSPORT_AND_LANGUAGE_ADDITIONS.md`](https://github.com/opurom/opurom-spec/blob/main/TRANSPORT_AND_LANGUAGE_ADDITIONS.md)
 section 1.
 
 ## Architecture
