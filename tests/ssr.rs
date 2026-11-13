@@ -37,7 +37,7 @@ const IR: &str = r##"{
     ],
     "events": {}
   },
-  "theme": { "mode": "system", "accent": "#4F46E5", "radius": 12 }
+  "theme": { "mode": "system", "accent": "#097FEB", "radius": 12 }
 }"##;
 
 #[test]
@@ -58,7 +58,7 @@ fn theme_changes_the_output() {
     assert_ne!(base, dark);
     assert!(dark.contains("#FF4D6D"), "{}", dark);
     assert!(dark.contains("--radius: 4px"), "{}", dark);
-    assert!(base.contains("#4F46E5"), "{}", base);
+    assert!(base.contains("#097FEB"), "{}", base);
 }
 
 #[test]
