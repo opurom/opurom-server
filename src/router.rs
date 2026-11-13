@@ -67,6 +67,34 @@ impl Route {
         }
         Some(params)
     }
+
+    /// Rebuild the pattern from the parsed segments so a reported path matches
+    /// the segments the router actually compares rather than the raw string.
+    fn pattern(&self) -> String {
+        let mut pattern = String::from("/");
+        for (index, segment) in self.segments.iter().enumerate() {
+            if index > 0 {
+                pattern.push('/');
+            }
+            match segment {
+                Segment::Literal(literal) => pattern.push_str(literal),
+                Segment::Param(name) => {
+                    pattern.push(':');
+                    pattern.push_str(name);
+                }
+            }
+        }
+        pattern
+    }
+}
+
+/// A registered route as reported by [`Router::routes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisteredRoute {
+    /// The HTTP method the route answers.
+    pub method: Method,
+    /// The canonical path pattern, with `:name` for parameter segments.
+    pub path: String,
 }
 
 /// The routing table.
@@ -78,6 +106,20 @@ pub struct Router {
 impl Router {
     pub fn new() -> Router {
         Router { routes: Vec::new() }
+    }
+
+    /// Report the registered routes in registration order.
+    ///
+    /// The canonical pattern lets inspection tooling enumerate the table
+    /// without keeping a second copy of the patterns.
+    pub fn routes(&self) -> Vec<RegisteredRoute> {
+        self.routes
+            .iter()
+            .map(|route| RegisteredRoute {
+                method: route.method.clone(),
+                path: route.pattern(),
+            })
+            .collect()
     }
 
     /// Register a handler for `method` and `pattern`.

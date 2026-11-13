@@ -50,7 +50,7 @@ pub use middleware::{
     ALT_SVC_ENV, AUTH_TOKEN_ENV, CORS_ENV, ETAG_ENV, GZIP_THRESHOLD_BYTES, RATE_LIMIT_ENV,
     RATE_LIMIT_WINDOW_SECS, STRUCTURED_LOG_ENV,
 };
-pub use router::Router;
+pub use router::{RegisteredRoute, Router};
 pub use server::{
     Server, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, KEEP_ALIVE_ENV, TLS_ENV, WEBSOCKET_ENV,
 };
