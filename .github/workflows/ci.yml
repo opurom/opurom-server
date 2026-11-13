@@ -31,6 +31,12 @@ jobs:
         with:
           components: rustfmt
           targets: wasm32-unknown-unknown
+      # The IDE plugin project compiles a Java plugin, so its tests need a JDK 21.
+      - uses: actions/setup-java@v4
+        if: matrix.check == 'node-test' || matrix.check == 'validate'
+        with:
+          distribution: temurin
+          java-version: '21'
       - name: Install libsqlite3-dev
         if: matrix.check == 'rust-test'
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
