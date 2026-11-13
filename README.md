@@ -98,7 +98,9 @@ tooling can enumerate verbs and paths without keeping a second list.
 ## HTTP contract
 
 * Request: HTTP/1.1 request line, headers, `Content-Length` body. `Transfer-Encoding`
-  is rejected with 501.
+  is rejected with 501. `Expect: 100-continue` on an HTTP/1.1 request gets the interim
+  `HTTP/1.1 100 Continue` answer before the body is read, and an unknown `Expect` value
+  gets 417.
 * Body cap: 1 MiB (`http::MAX_BODY_BYTES`). A larger body gets `413` and the body is
   drained so the client can read the answer.
 * Header cap: 64 KiB (`http::MAX_HEADER_BYTES`) covers the request line and all
@@ -142,6 +144,7 @@ tooling can enumerate verbs and paths without keeping a second list.
 | Unknown path | 404 | `{"error":"not_found"}` |
 | Wrong method | 405 | `{"error":"method_not_allowed"}` |
 | Body over 1 MiB | 413 | `{"error":"payload_too_large"}` |
+| Unknown `Expect` value | 417 | `{"error":"expectation_failed"}` |
 | Header block over 64 KiB | 431 | `{"error":"header_block_too_large"}` |
 | Incomplete request read times out | 408 | `{"error":"request_timeout"}` |
 | Rate limit exceeded | 429 | `{"error":"rate_limited"}` plus `Retry-After` seconds |
@@ -837,7 +840,7 @@ cargo fmt --all
 cargo test
 ```
 
-`cargo test` runs 126 tests: the base HTTP, SSR, hardening, codegen and
+`cargo test` runs 129 tests: the base HTTP, request-contract, SSR, hardening, codegen and
 router-introspection suites plus the opt-in HTTP, TLS, WebSocket, keep-alive,
 mutual-TLS, HTTP/2, HTTP/3 and certificate-status suites. Several suites
 drive a real server on an ephemeral port over TCP:
@@ -846,7 +849,7 @@ drive a real server on an ephemeral port over TCP:
 | --- | --- |
 | `tests/http_server.rs` | health, the full CRUD lifecycle, 404, 405, 413, the 1 MiB boundary, panic -> 500 -> 503 with other routes still serving, `:param` matching |
 | `tests/router_introspection.rs` | the route-table query: an empty table, methods and patterns in registration order, canonical pattern normalization and a read-only query that leaves dispatch unchanged |
-| `tests/request_bounds.rs` | loopback TCP checks for the 1 MiB body cap (413), the 64 KiB header block cap (431), an unterminated oversized header line stopped by the same cap, a stalled request timing out with 408 while another connection still gets 200, pipelined requests answered in order and the documented limit constants |
+| `tests/request_bounds.rs` | loopback TCP checks for the 1 MiB body cap (413), the 64 KiB header block cap (431), an unterminated oversized header line stopped by the same cap, a stalled request timing out with 408 while another connection still gets 200, pipelined requests answered in order, the `Expect: 100-continue` interim answer with the body after it, 417 for an unknown expectation, a 413 behind `Expect` without a drain wait and the documented limit constants |
 | `tests/ssr.rs` | byte-identical output for the same IR and theme, theme changes the output, state interpolation, kind -> HTML element mapping, IR version validation |
 | `tests/codegen.rs` | generated crate shape, migration SQL, deterministic lowering, IR validation, one shared `PooledDb` in generated code |
 | `tests/hardening.rs` | deterministic N/N+1 rate-limit boundary and window reset, `OPR_RATE_LIMIT` over TCP, JSON log shape with numeric measured `elapsed_ms`, one JSON stderr line per request, byte-identical default responses |

@@ -1,7 +1,7 @@
 //! HTTP/1.1 primitives: method, request, response and a bounded std-only parser.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, ErrorKind, Read};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 
 use serde_json::Value;
 
@@ -179,6 +179,7 @@ pub fn status_text(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         408 => "Request Timeout",
         413 => "Payload Too Large",
+        417 => "Expectation Failed",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
@@ -209,7 +210,15 @@ impl HttpError {
 /// body. Bodies larger than `max_body` are rejected with 413 before buffering.
 /// The request line and headers share one `MAX_HEADER_BYTES` budget enforced
 /// while reading, so an endless line cannot be buffered without a bound.
-pub fn read_request<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Request, HttpError> {
+///
+/// `Expect: 100-continue` on an HTTP/1.1 request writes the interim
+/// `HTTP/1.1 100 Continue` answer to the transport before the body read, so a
+/// client that withholds the body is not blocked. The writer bound is that
+/// interim answer; every other request writes nothing here.
+pub fn read_request<R: Read + Write>(
+    reader: &mut BufReader<R>,
+    max_body: usize,
+) -> Result<Request, HttpError> {
     let mut head = Read::take(&mut *reader, (MAX_HEADER_BYTES + 1) as u64);
     let mut request_line = String::new();
     let read = head
@@ -265,6 +274,7 @@ pub fn read_request<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Reque
     drop(head);
 
     let mut length = 0usize;
+    let mut expectation: Option<&str> = None;
     for (name, value) in &headers {
         if name.eq_ignore_ascii_case("content-length") {
             length = value
@@ -274,12 +284,33 @@ pub fn read_request<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Reque
         if name.eq_ignore_ascii_case("transfer-encoding") {
             return Err(HttpError::new(501, "transfer_encoding_not_supported"));
         }
+        if name.eq_ignore_ascii_case("expect") && expectation.is_none() {
+            expectation = Some(value.as_str());
+        }
     }
+    // An expectation the server does not understand is refused before the body
+    // is read; HTTP/1.0 requests ignore `100-continue` and read as usual.
+    let wants_continue = match expectation {
+        None => false,
+        Some(value) if value.eq_ignore_ascii_case("100-continue") => version == "HTTP/1.1",
+        Some(_) => return Err(HttpError::new(417, "expectation_failed")),
+    };
     if length > max_body {
         // Drain the oversized body so the client can read the 413 answer
-        // instead of hitting a broken pipe.
-        drain(reader, length);
+        // instead of hitting a broken pipe. A client that withholds the body
+        // behind the interim answer has sent nothing to drain.
+        if !wants_continue {
+            drain(reader, length);
+        }
         return Err(HttpError::new(413, "payload_too_large"));
+    }
+    if wants_continue && length > 0 {
+        // The client holds the body until this interim answer arrives.
+        reader
+            .get_mut()
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .and_then(|()| reader.get_mut().flush())
+            .map_err(|_| HttpError::new(400, "bad_request: cannot send 100 Continue"))?;
     }
 
     let mut body = vec![0u8; length];
