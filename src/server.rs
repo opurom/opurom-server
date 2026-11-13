@@ -9,8 +9,9 @@
 //!
 //! capability adds opt-in `OPR_MTLS=1` client certificates, the `OPR_REVOKED` static
 //! fingerprint deny list and ALPN reporting. capability serves real HTTP/2 when ALPN
-//! selects `h2`; every other connection keeps the HTTP/1.1 path. No new
-//! environment variable enables HTTP/2.
+//! selects `h2`; every other connection keeps the HTTP/1.1 path. capability adds
+//! required static local DER CRL/OCSP status sources to the mTLS handshake.
+//! No new environment variable enables HTTP/2.
 //!
 //! With none of the capability variables set, no client ALPN offer and no `h2`
 //! negotiation, the capability wire format and response bytes stay identical.
@@ -372,8 +373,12 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
     let report_handshake_error = |err: &std::io::Error| {
         if requires_client_auth {
             eprintln!(
-                "[opurom-server] mTLS handshake refused: client certificate missing, untrusted or revoked (check {} and {}): {}",
-                tls::CLIENT_CA_ENV, tls::REVOKED_ENV, err
+                "[opurom-server] mTLS handshake refused: client certificate missing, untrusted, revoked or status unavailable (check {}, {}, {} and {}): {}",
+                tls::CLIENT_CA_ENV,
+                tls::REVOKED_ENV,
+                tls::CRL_FILE_ENV,
+                tls::OCSP_FILE_ENV,
+                err
             );
         } else {
             eprintln!("[opurom-server] TLS handshake failed: {}", err);

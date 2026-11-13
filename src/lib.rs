@@ -1,4 +1,4 @@
-//! Opurom capability/capability/capability/capability/capability/capability backend runtime.
+//! Opurom capability/capability/capability/capability/capability/capability/capability backend runtime.
 //!
 //! The library uses `serde_json` for IR and JSON responses and `flate2` for
 //! opt-in gzip. It provides:
@@ -10,12 +10,15 @@
 //! * [`server`] - a thread-per-connection `TcpListener` server with optional
 //!   TLS, ALPN-selected HTTP/2 and HTTP/1.1 keep-alive.
 //! * [`tls`] - the optional TLS listener with a self-signed fallback, opt-in
-//!   client-certificate mTLS, a static fingerprint deny list and ALPN.
+//!   client-certificate mTLS, a static fingerprint deny list, static local
+//!   DER CRL/OCSP status sources and ALPN.
+//! * [`cert_status`] - bounded DER CRL/BasicOCSPResponse parsing and status checks.
 //! * [`websocket`] - the RFC 6455 frame codec, server channel and client.
 //! * [`ssr`] - deterministic server-side HTML rendering of the same IR tree.
 //! * [`ir`] - the full-stack IR 0.1.0 data model.
 //! * [`codegen`] - the `opurom-serverc` lowering pass.
 
+pub mod cert_status;
 pub mod codegen;
 pub mod http;
 pub mod http2;
