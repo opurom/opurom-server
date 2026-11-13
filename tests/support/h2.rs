@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-//! Shared real h2 client helper for capability/capability integration tests.
+//! Shared real h2 client helper for the TLS integration tests.
 //!
 //! All requests in one `exchange` call use one TLS connection and one h2
 //! connection, with response tasks and body writes driven concurrently.

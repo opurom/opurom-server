@@ -1,4 +1,4 @@
-//! capability TLS tests: a real handshake over a real socket, the self-signed
+//! TLS tests: a real handshake over a real socket, the self-signed
 //! fallback, the fingerprint log line and the clear error paths.
 
 use std::fs;

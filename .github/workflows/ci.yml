@@ -31,6 +31,12 @@ jobs:
         with:
           components: rustfmt
           targets: wasm32-unknown-unknown
+      # Only the IDE plugin project compiles Java, so only it needs a JDK.
+      - uses: actions/setup-java@v4
+        if: matrix.check == 'node-test' && github.event.repository.name == 'opurom-ide-plugins'
+        with:
+          distribution: temurin
+          java-version: '21'
       - name: Install libsqlite3-dev
         if: matrix.check == 'rust-test'
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev

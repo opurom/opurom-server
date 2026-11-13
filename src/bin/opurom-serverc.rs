@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use opurom_server::codegen::{lower_service, DEFAULT_DEP_ROOT};
+use opurom_server::codegen::{default_dep_root, lower_service};
 
 fn main() -> ExitCode {
     match run() {
@@ -26,7 +26,7 @@ fn run() -> Result<String, String> {
     let mut args = std::env::args().skip(1);
     let mut ir_path: Option<PathBuf> = None;
     let mut out_dir: Option<PathBuf> = None;
-    let mut dep_root = PathBuf::from(DEFAULT_DEP_ROOT);
+    let mut dep_root: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -40,7 +40,7 @@ fn run() -> Result<String, String> {
                 let value = args
                     .next()
                     .ok_or_else(|| "missing value for --dep-root".to_string())?;
-                dep_root = PathBuf::from(value);
+                dep_root = Some(PathBuf::from(value));
             }
             "--help" | "-h" => {
                 return Ok(
@@ -65,6 +65,12 @@ fn run() -> Result<String, String> {
 
     let ir_path = ir_path.ok_or_else(|| "missing IR file argument".to_string())?;
     let out_dir = out_dir.ok_or_else(|| "missing --out <dir> argument".to_string())?;
+    // The explicit override wins; without it the workspace is discovered at
+    // runtime from the working directory or the executable location.
+    let dep_root = match dep_root {
+        Some(root) => root,
+        None => default_dep_root()?,
+    };
     let ir_json = std::fs::read_to_string(&ir_path)
         .map_err(|err| format!("cannot read {}: {}", ir_path.display(), err))?;
 
