@@ -31,9 +31,9 @@ jobs:
         with:
           components: rustfmt
           targets: wasm32-unknown-unknown
-      # The IDE plugin project compiles a Java plugin, so its tests need a JDK 21.
+      # Only the IDE plugin project compiles Java, so only it needs a JDK.
       - uses: actions/setup-java@v4
-        if: matrix.check == 'node-test' || matrix.check == 'validate'
+        if: matrix.check == 'node-test' && github.event.repository.name == 'opurom-ide-plugins'
         with:
           distribution: temurin
           java-version: '21'
