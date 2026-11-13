@@ -5,6 +5,7 @@
 //!
 //! * [`http`] - HTTP/1.1 request/response types and a bounded parser.
 //! * [`http2`] - real HTTP/2 frames over an ALPN-selected TLS connection.
+//! * [`http3`] - real HTTP/3 over QUIC on a separate UDP listener.
 //! * [`router`] - literal and `:param` routing with per-route fault isolation.
 //! * [`middleware`] - middleware, rate limiting, logs and opt-in HTTP features.
 //! * [`server`] - a thread-per-connection `TcpListener` server with optional
@@ -22,6 +23,7 @@ pub mod cert_status;
 pub mod codegen;
 pub mod http;
 pub mod http2;
+pub mod http3;
 pub mod ir;
 pub mod middleware;
 pub mod router;
@@ -36,11 +38,16 @@ pub use http2::{
     INITIAL_WINDOW_SIZE, MAX_CONCURRENT_STREAMS, MAX_FRAME_SIZE, MAX_HEADER_LIST_SIZE,
     MAX_SEND_BUFFER_SIZE,
 };
+pub use http3::{
+    Http3Endpoint, Http3Server, State as Http3State, DEFAULT_HTTP3_PORT, HTTP3_ALPN, HTTP3_ENV,
+    HTTP3_PORT_ENV,
+};
 pub use middleware::{
-    constant_time_eq, cors_origin_from_env_value, etag_for, rate_limit, rate_limit_from_env,
-    rate_limited_response, request_log_line, structured_logging_enabled, tls_request_log_line,
-    HttpOptions, MiddlewareChain, RateLimiter, AUTH_TOKEN_ENV, CORS_ENV, ETAG_ENV,
-    GZIP_THRESHOLD_BYTES, RATE_LIMIT_ENV, RATE_LIMIT_WINDOW_SECS, STRUCTURED_LOG_ENV,
+    alt_svc_header_value, alt_svc_port_from_env, constant_time_eq, cors_origin_from_env_value,
+    etag_for, rate_limit, rate_limit_from_env, rate_limited_response, request_log_line,
+    structured_logging_enabled, tls_request_log_line, HttpOptions, MiddlewareChain, RateLimiter,
+    ALT_SVC_ENV, AUTH_TOKEN_ENV, CORS_ENV, ETAG_ENV, GZIP_THRESHOLD_BYTES, RATE_LIMIT_ENV,
+    RATE_LIMIT_WINDOW_SECS, STRUCTURED_LOG_ENV,
 };
 pub use router::Router;
 pub use server::{

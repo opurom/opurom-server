@@ -280,12 +280,7 @@ async fn write_body(send: &mut SendStream<Bytes>, body: &[u8]) -> Result<(), Str
 }
 
 fn is_connection_specific(name: &str) -> bool {
-    name.eq_ignore_ascii_case("connection")
-        || name.eq_ignore_ascii_case("keep-alive")
-        || name.eq_ignore_ascii_case("proxy-connection")
-        || name.eq_ignore_ascii_case("transfer-encoding")
-        || name.eq_ignore_ascii_case("upgrade")
-        || name.eq_ignore_ascii_case("te")
+    crate::http::is_connection_specific(name)
 }
 
 fn io_error(err: impl std::fmt::Display) -> io::Error {
