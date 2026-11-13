@@ -10,10 +10,12 @@
 //! Scope: no HTTP/3/QUIC, server push, priority tree or connection coalescing.
 
 use std::collections::BTreeMap;
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::io;
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -152,7 +154,7 @@ async fn serve_connection(
 
 async fn serve_stream(
     request: http::Request<RecvStream>,
-    respond: SendResponse<Bytes>,
+    mut respond: SendResponse<Bytes>,
     state: State,
 ) {
     let started = Instant::now();
@@ -160,21 +162,15 @@ async fn serve_stream(
     let mut app_request = app_request(&parts);
     let method = app_request.method.as_str().to_string();
     let path = app_request.path.clone();
-    let response = match read_body(&mut request_body, state.max_body).await {
-        Ok(body) => {
-            app_request.body = body;
-            dispatch_request(
-                &mut app_request,
-                state.router.as_ref(),
-                state.middleware.as_ref(),
-                state.limiter.as_deref(),
-                state.options.as_ref(),
-            )
-        }
-        Err(response) => response,
-    };
+    let response =
+        match read_request(&mut request_body, &mut respond, &state, &mut app_request).await {
+            Some(response) => response,
+            // The client reset the stream: dropping the body frees h2's buffered
+            // frames and returns the connection flow window.
+            None => return,
+        };
 
-    if let Err(err) = send_response(respond, &response).await {
+    if let Err(err) = send_response(&mut respond, &response).await {
         eprintln!("[opurom-server] HTTP/2 stream failed: {}", err);
         return;
     }
@@ -185,6 +181,40 @@ async fn serve_stream(
             tls_request_log_line(&method, &path, response.status, elapsed_ms, "h2")
         );
     }
+}
+
+/// Read the body and dispatch, watching for a client RST_STREAM the whole
+/// time: a cancelled stream never runs its handler or sends a response.
+async fn read_request(
+    body: &mut RecvStream,
+    respond: &mut SendResponse<Bytes>,
+    state: &State,
+    app_request: &mut AppRequest,
+) -> Option<AppResponse> {
+    let mut read = pin!(read_body(body, state.max_body));
+    poll_fn(|cx| {
+        // Any completed reset means the stream is dead: stop before dispatch.
+        if let Poll::Ready(_) = respond.poll_reset(cx) {
+            return Poll::Ready(None);
+        }
+        match read.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => Poll::Ready(Some(match result {
+                Ok(body) => {
+                    app_request.body = body;
+                    dispatch_request(
+                        app_request,
+                        state.router.as_ref(),
+                        state.middleware.as_ref(),
+                        state.limiter.as_deref(),
+                        state.options.as_ref(),
+                    )
+                }
+                Err(response) => response,
+            })),
+        }
+    })
+    .await
 }
 
 fn app_request(parts: &Parts) -> AppRequest {
@@ -235,7 +265,7 @@ async fn read_body(body: &mut RecvStream, max_body: usize) -> Result<Vec<u8>, Ap
 }
 
 async fn send_response(
-    mut respond: SendResponse<Bytes>,
+    respond: &mut SendResponse<Bytes>,
     response: &AppResponse,
 ) -> Result<(), String> {
     let head = h2_response(response)?;
