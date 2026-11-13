@@ -426,6 +426,8 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
         .as_ref()
         .is_some_and(|config| config.requires_client_auth());
     let _ = stream.set_nodelay(true);
+    // shortcut: a trickle of bytes resets each read timeout; upgrade to a
+    // total request deadline when slowloris resistance is required.
     let _ = stream.set_read_timeout(Some(idle_timeout));
     let report_handshake_error = |err: &std::io::Error| {
         if requires_client_auth {
