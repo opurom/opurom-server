@@ -73,7 +73,7 @@ accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
 | `http2` | ALPN-selected HTTP/2: h2 HEADERS/DATA, HPACK, stream multiplexing, flow control, bounded settings, graceful GOAWAY and mapping into the shared request pipeline |
 | `http3` | HTTP/3 over QUIC on a separate UDP listener: the TLS 1.3 and ALPN `h3` endpoint, the real h3 request/response exchange and mapping into the shared request pipeline |
 | `middleware` | `MiddlewareChain`, `RateLimiter`, logging helpers, body cap, opt-in HTTP options |
-| `router` | route table, `:param` matching, panic isolation, 3-strike breaker |
+| `router` | route table, `:param` matching, panic isolation, 3-strike breaker, route introspection |
 | `server` | `TcpListener` accept loop, one thread per connection, optional TLS, ALPN-selected HTTP/2, optional keep-alive, optional WebSocket upgrade, opt-in response features and measured JSON log |
 | `tls` | the optional TLS listener: environment configuration, PEM loading, self-signed fallback, SHA-256 fingerprint, opt-in client-certificate mTLS, static fingerprint deny list, local DER CRL/OCSP status sources, HTTP CRL distribution point configuration and ALPN |
 | `cert_status` | bounded DER CRL/BasicOCSPResponse parsing, CA signature checks, serial matching, freshness checks, std-only HTTP CRL retrieval with a URL-keyed cache and fail-closed status decisions |
@@ -84,6 +84,16 @@ accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
 
 Errors are values everywhere: a failed request is a `Response`, a panicking
 handler is caught, and no failure path aborts the process.
+
+## Router introspection
+
+`Router::routes()` reports the registered routes in registration order. Each
+entry is a `RegisteredRoute` with the `method` and the canonical `path`
+pattern; `:name` parameter segments appear as they do at registration.
+Repeated slashes and a trailing slash are normalized in the reported pattern
+to the segments the router compares. The query is a read-only view of the table:
+it neither dispatches a request nor changes router state, so layer-inspection
+tooling can enumerate verbs and paths without keeping a second list.
 
 ## HTTP contract
 
@@ -827,14 +837,15 @@ cargo fmt --all
 cargo test
 ```
 
-`cargo test` runs 95 tests: the base HTTP, SSR, hardening and codegen suites
-plus the opt-in HTTP, TLS, WebSocket, keep-alive, mutual-TLS, HTTP/2 and
-certificate-status suites. Several suites drive a real server on an ephemeral
-port over TCP:
+`cargo test` runs 126 tests: the base HTTP, SSR, hardening, codegen and
+router-introspection suites plus the opt-in HTTP, TLS, WebSocket, keep-alive,
+mutual-TLS, HTTP/2, HTTP/3 and certificate-status suites. Several suites
+drive a real server on an ephemeral port over TCP:
 
 | Test file | Covers |
 | --- | --- |
 | `tests/http_server.rs` | health, the full CRUD lifecycle, 404, 405, 413, the 1 MiB boundary, panic -> 500 -> 503 with other routes still serving, `:param` matching |
+| `tests/router_introspection.rs` | the route-table query: an empty table, methods and patterns in registration order, canonical pattern normalization and a read-only query that leaves dispatch unchanged |
 | `tests/request_bounds.rs` | loopback TCP checks for the 1 MiB body cap (413), the 64 KiB header block cap (431), an unterminated oversized header line stopped by the same cap, a stalled request timing out with 408 while another connection still gets 200, pipelined requests answered in order and the documented limit constants |
 | `tests/ssr.rs` | byte-identical output for the same IR and theme, theme changes the output, state interpolation, kind -> HTML element mapping, IR version validation |
 | `tests/codegen.rs` | generated crate shape, migration SQL, deterministic lowering, IR validation, one shared `PooledDb` in generated code |
@@ -862,6 +873,7 @@ Implemented and verified in this repository:
 | Area | Status |
 | --- | --- |
 | HTTP/1.1 routing (literal + `:param`) | Implemented, tested |
+| Route table introspection | Implemented, tested |
 | Five CRUD verbs via the generated service | Implemented, verified end to end against `opurom-db` |
 | SQLite-backed storage (via `opurom-db`) | Implemented through the sibling crate |
 | One shared Mutex-serialized SQLite handle | Implemented in generated services, tested in `opurom-db` and smoke-tested |
