@@ -626,6 +626,28 @@ one request.
 [h3] GET /health after the panic -> 200 body={"ok":true}
 ```
 
+### Measured HTTP/3 concurrency and body boundaries
+
+Three more integration tests measure the shared router under concurrent HTTP/3
+load. One batch opens eight in-flight `GET` streams on a single QUIC
+connection and asserts the exact body of every response; a second batch sends
+ten concurrent requests where two hit the panicking handler and asserts the
+exact `500` diagnostic next to the exact `200` bodies; a third echoes POST
+bodies at the boundary sizes of the 1 MiB cap through HTTP/3 and the HTTP/1.1
+path of the same router and asserts both answers are identical. Every number
+below is measured with `std::time::Instant` during the run that produced it:
+
+```
+[h3] 8 concurrent GET requests on one QUIC connection -> 8x 200 with exact bodies; handshake=1.925958ms batch=964.583µs per-request=830.833µs..857.5µs
+[h3] GET /health after the batch -> 200 body={"ok":true}
+[h3] 10 concurrent requests, 2 to the panicking route -> 8x 200 with exact bodies, 2x 500 {"error":"handler_panic"}; batch=1.623375ms
+[h3] GET /health after the load -> 200 body={"ok":true}
+[h3] POST /echo 0 bytes -> HTTP/1.1 200 and HTTP/3 200 return the identical echo; h3 request=925.042µs
+[h3] POST /echo 1 bytes -> HTTP/1.1 200 and HTTP/3 200 return the identical echo; h3 request=769.042µs
+[h3] POST /echo 4096 bytes -> HTTP/1.1 200 and HTTP/3 200 return the identical echo; h3 request=364.083µs
+[h3] POST /echo 1048576 bytes -> HTTP/1.1 200 and HTTP/3 200 return the identical echo; h3 request=19.04025ms
+```
+
 ## Certificate status (opt-in)
 
 Real certificate status checks run on the same rustls mTLS listener. They do
