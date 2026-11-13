@@ -1,5 +1,6 @@
-//! Loopback TCP tests for the HTTP/1.1 request bounds: the body cap, the
-//! header block cap, read timeouts and pipelined requests.
+//! Loopback TCP tests for the HTTP/1.1 request contract: the body cap, the
+//! header block cap, read timeouts, pipelined requests and the `Expect`
+//! handshake.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -157,6 +158,70 @@ fn oversized_body_is_rejected_with_413() {
     assert_eq!(answer.status_line, "HTTP/1.1 413 Payload Too Large");
     assert_eq!(answer.status, 413);
     assert_eq!(answer.body, "{\"error\":\"payload_too_large\"}");
+    shutdown.store(true, Ordering::Relaxed);
+}
+
+#[test]
+fn expect_100_continue_is_answered_before_the_body_arrives() {
+    let (port, shutdown) = start(Duration::from_secs(5), false);
+    let mut stream = connect(port, Duration::from_secs(5));
+    // The head only: the body stays unsent until the interim answer lands.
+    stream
+        .write_all(
+            b"POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n",
+        )
+        .expect("write request head");
+
+    let interim = read_answer(&mut stream);
+    assert_eq!(interim.status_line, "HTTP/1.1 100 Continue");
+    assert_eq!(interim.status, 100);
+    assert_eq!(interim.body, "");
+
+    stream.write_all(b"hello").expect("write body");
+    let answer = read_answer(&mut stream);
+    assert_eq!(answer.status_line, "HTTP/1.1 201 Created");
+    assert_eq!(answer.status, 201);
+    assert_eq!(answer.body, "{\"uploaded\":true}");
+    shutdown.store(true, Ordering::Relaxed);
+}
+
+#[test]
+fn an_unknown_expectation_is_417() {
+    let (port, shutdown) = start(Duration::from_secs(5), false);
+    let mut stream = connect(port, Duration::from_secs(5));
+    stream
+        .write_all(
+            b"POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nExpect: other-expectation\r\n\r\n",
+        )
+        .expect("write request head");
+
+    let answer = read_answer(&mut stream);
+    assert_eq!(answer.status_line, "HTTP/1.1 417 Expectation Failed");
+    assert_eq!(answer.status, 417);
+    assert_eq!(answer.body, "{\"error\":\"expectation_failed\"}");
+    shutdown.store(true, Ordering::Relaxed);
+}
+
+#[test]
+fn an_oversized_body_behind_expect_is_413_without_a_drain_wait() {
+    let (port, shutdown) = start(Duration::from_secs(5), false);
+    let mut stream = connect(port, Duration::from_secs(5));
+    let head = format!(
+        "POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nExpect: 100-continue\r\n\r\n",
+        MAX_BODY_BYTES + 1
+    );
+    let started = Instant::now();
+    stream
+        .write_all(head.as_bytes())
+        .expect("write request head");
+
+    let answer = read_answer(&mut stream);
+    assert_eq!(answer.status, 413);
+    assert_eq!(answer.body, "{\"error\":\"payload_too_large\"}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the 413 must arrive without waiting for a body that was never sent"
+    );
     shutdown.store(true, Ordering::Relaxed);
 }
 
