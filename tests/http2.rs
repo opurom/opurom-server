@@ -645,3 +645,25 @@ fn h2_rst_stream_unknown_and_closed_streams_are_ignored() {
         "[h2] four RST_STREAM frames on unknown (1, 3) and closed (5) streams were ignored; streams 7 and 9 served 200 with no GOAWAY"
     );
 }
+
+#[test]
+fn h2_head_reads_get_headers_without_a_body() {
+    let server = start_server(&[("OPR_ETAG", "1")], router());
+    let requests = vec![
+        with_dev_headers(RequestSpec::get("/health")),
+        with_dev_headers(RequestSpec::new("HEAD", "/health")),
+    ];
+    let (alpn, answers) = exchange(server.addr.port(), &server.cert_der, None, requests)
+        .expect("one h2 connection serves GET and HEAD");
+    assert_eq!(alpn.as_deref(), Some("h2"));
+    assert_eq!(answers[0].status, 200);
+    assert_eq!(answers[1].status, 200);
+    assert!(answers[1].body.is_empty(), "HEAD sends no DATA frame");
+    assert_eq!(
+        answers[1].header("content-length"),
+        answers[0].header("content-length"),
+        "HEAD repeats the GET content length"
+    );
+    assert_eq!(answers[1].header("etag"), answers[0].header("etag"));
+    println!("[h2] HEAD /health=200 with the GET content-length and ETag, no DATA frame");
+}

@@ -263,11 +263,12 @@ async fn serve_request(resolver: RequestResolver<h3_quinn::Connection, Bytes>, s
     let mut app_request = app_request(&request);
     let method = app_request.method.as_str().to_string();
     let path = app_request.path.clone();
+    let head_only = app_request.method == Method::Head;
 
     let body = match read_body(&mut stream, state.max_body).await {
         Ok(body) => body,
         Err(response) => {
-            send_response(&mut stream, &response).await;
+            send_response(&mut stream, &response, false).await;
             return;
         }
     };
@@ -280,7 +281,7 @@ async fn serve_request(resolver: RequestResolver<h3_quinn::Connection, Bytes>, s
         state.limiter.as_deref(),
         state.options.as_ref(),
     );
-    send_response(&mut stream, &response).await;
+    send_response(&mut stream, &response, head_only).await;
 
     if structured_logging_enabled() {
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -347,6 +348,7 @@ async fn read_body(
 async fn send_response(
     stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     response: &AppResponse,
+    head_only: bool,
 ) {
     let status = http::StatusCode::from_u16(response.status)
         .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -370,7 +372,8 @@ async fn send_response(
     if stream.send_response(head).await.is_err() {
         return;
     }
-    if !response.body.is_empty() {
+    // A HEAD answer ends at the headers, sending no DATA frame.
+    if !head_only && !response.body.is_empty() {
         let _ = stream.send_data(Bytes::from(response.body.clone())).await;
     }
     let _ = stream.finish().await;

@@ -18,6 +18,8 @@ pub enum Method {
     Post,
     Put,
     Delete,
+    /// `HEAD` reads a `GET` response's headers without the body.
+    Head,
     Other(String),
 }
 
@@ -28,6 +30,7 @@ impl Method {
             "POST" => Method::Post,
             "PUT" => Method::Put,
             "DELETE" => Method::Delete,
+            "HEAD" => Method::Head,
             other => Method::Other(other.to_string()),
         }
     }
@@ -38,6 +41,7 @@ impl Method {
             Method::Post => "POST",
             Method::Put => "PUT",
             Method::Delete => "DELETE",
+            Method::Head => "HEAD",
             Method::Other(other) => other,
         }
     }
