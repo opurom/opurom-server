@@ -12,17 +12,17 @@ an HTTP CRL distribution point with a refreshable cache, and
 Rust service crate.
 
 This crate implements the backend half of
-[`the framework implementation`](../opurom-examples/golden/the framework implementation) framework rules,
-[`the toolchain implementation`](../opurom-examples/golden/the toolchain implementation)
+[`the framework implementation`](the framework implementation) framework rules,
+[`the toolchain implementation`](the toolchain implementation)
 framework rules,
-[`the GPU implementation`](../opurom-examples/golden/the GPU implementation) framework rules,
-[`the network implementation`](../opurom-examples/golden/the network implementation) framework rules and 5,
-[`the surface implementation`](../opurom-examples/golden/the surface implementation)
+[`the GPU implementation`](the GPU implementation) framework rules,
+[`the network implementation`](the network implementation) framework rules and 5,
+[`the surface implementation`](the surface implementation)
 framework rules,
-[`the framework rules`](../opurom-examples/golden/the framework rules) framework rules,
-[`the component catalog rules`](../opurom-examples/golden/the component catalog rules)
+[`the framework rules`](the framework rules) framework rules,
+[`the component catalog rules`](the component catalog rules)
 framework rules and
-[`TRANSPORT_AND_the language rules`](../opurom-examples/golden/TRANSPORT_AND_the language rules)
+[`TRANSPORT_AND_the language rules`](TRANSPORT_AND_the language rules)
 framework rules.
 
 ## Architecture
