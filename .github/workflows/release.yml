@@ -34,14 +34,20 @@ jobs:
           set -euo pipefail
           git fetch --tags --force
           HEAD_SHA=$(git rev-parse HEAD)
-          EXISTING=$(git tag --points-at "$HEAD_SHA" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]{4}$' | head -1 || true)
+          EXISTING=$(git tag --points-at "$HEAD_SHA" | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.[1-9][0-9]*)?$' | head -1 || true)
           if [ -n "$EXISTING" ]; then
-            echo "tag=$EXISTING" >> "$GITHUB_OUTPUT"
+            TAG="$EXISTING"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
             echo "preexisting=true" >> "$GITHUB_OUTPUT"
           else
             TAG=$(git tag --list 'v*' | node .github/scripts/next-version.mjs)
             echo "tag=$TAG" >> "$GITHUB_OUTPUT"
             echo "preexisting=false" >> "$GITHUB_OUTPUT"
+          fi
+          if printf '%s' "$TAG" | grep -qE -- '-(alpha|beta|rc)\.'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Push lightweight tag
@@ -59,4 +65,4 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ github.event.repository.name }} ${{ steps.version.outputs.tag }}
           generate_release_notes: true
-          prerelease: false
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
