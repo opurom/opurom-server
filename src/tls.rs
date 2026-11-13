@@ -9,15 +9,16 @@
 //! `OPR_MTLS=1` with `OPR_CLIENT_CA` makes the listener require and verify a
 //! client certificate during the rustls handshake. `OPR_REVOKED` is a static,
 //! comma-separated SHA-256 fingerprint deny list. `OPR_CRL_FILE` and
-//! `OPR_OCSP_FILE` add required static local DER status sources; both are
-//! checked on every mTLS handshake and fail closed when unusable. Both TLS
-//! modes advertise `h2` and `http/1.1` through ALPN; real HTTP/2 frames are
-//! served when `h2` is selected.
+//! `OPR_OCSP_FILE` add required local DER status sources, and `OPR_CRL_URL`
+//! adds an HTTP CRL distribution point (or `cert` to read the CRL
+//! Distribution Points extension of the presented certificate) whose DER is
+//! cached per URL and refreshed after `OPR_CRL_TTL_SECS`. Every source is
+//! checked on every mTLS handshake and fails closed when unusable; a
+//! configured local CRL file takes precedence over the URL. Both TLS modes
+//! advertise `h2` and `http/1.1` through ALPN; real HTTP/2 frames are served
+//! when `h2` is selected.
 //!
-//! The status sources are local files that are read at every handshake. There
-//! is no live OCSP responder fetch, no CRL distribution point and no
-//! certificate transparency; the cipher suites and protocol versions are the
-//! library defaults.
+//! The cipher suites and protocol versions are the library defaults.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -64,6 +65,13 @@ pub const CRL_FILE_ENV: &str = "OPR_CRL_FILE";
 /// Environment variable holding a required local DER BasicOCSPResponse path.
 pub const OCSP_FILE_ENV: &str = "OPR_OCSP_FILE";
 
+/// Environment variable holding the HTTP CRL distribution point URL, or the
+/// literal `cert` to read the URL from the client certificate extension.
+pub const CRL_URL_ENV: &str = "OPR_CRL_URL";
+
+/// Environment variable holding the fetched-CRL refresh interval in seconds.
+pub const CRL_TTL_SECS_ENV: &str = "OPR_CRL_TTL_SECS";
+
 /// The protocols advertised through ALPN, in server preference order.
 pub const ALPN_PROTOCOLS: &[&str] = &["h2", "http/1.1"];
 
@@ -101,7 +109,7 @@ pub struct MtlsOptions {
     pub client_ca_pem: Vec<u8>,
     /// SHA-256 fingerprints, with or without colons, in any hex case.
     pub revoked: Vec<String>,
-    /// A required DER CRL source, when `OPR_CRL_FILE` or a test supplies one.
+    /// A required DER CRL source, from `OPR_CRL_FILE` or `OPR_CRL_URL`.
     pub crl: Option<StatusSource>,
     /// A required DER BasicOCSPResponse source, when `OPR_OCSP_FILE` or a test supplies one.
     pub ocsp: Option<StatusSource>,
@@ -131,10 +139,16 @@ impl MtlsOptions {
             })?
         };
         let revoked = parse_revoked(&std::env::var(REVOKED_ENV).unwrap_or_default())?;
+        // A local CRL file is the stronger source and wins over a URL.
+        let crl = match cert_status::status_source_from_env(CRL_FILE_ENV) {
+            Some(file) => Some(file),
+            None => cert_status::crl_url_source_from_env(CRL_URL_ENV, CRL_TTL_SECS_ENV)
+                .map_err(|err| TlsError::new(format!("cannot use {}: {}", CRL_URL_ENV, err)))?,
+        };
         Ok(Some(MtlsOptions {
             client_ca_pem,
             revoked,
-            crl: cert_status::status_source_from_env(CRL_FILE_ENV),
+            crl,
             ocsp: cert_status::status_source_from_env(OCSP_FILE_ENV),
         }))
     }

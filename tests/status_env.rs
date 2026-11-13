@@ -41,6 +41,8 @@ const OPR_VARS: &[&str] = &[
     "OPR_CLIENT_CA",
     "OPR_REVOKED",
     "OPR_CRL_FILE",
+    "OPR_CRL_URL",
+    "OPR_CRL_TTL_SECS",
     "OPR_OCSP_FILE",
 ];
 

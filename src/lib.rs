@@ -11,9 +11,10 @@
 //! * [`server`] - a thread-per-connection `TcpListener` server with optional
 //!   TLS, ALPN-selected HTTP/2 and HTTP/1.1 keep-alive.
 //! * [`tls`] - the optional TLS listener with a self-signed fallback, opt-in
-//!   client-certificate mTLS, a static fingerprint deny list, static local
-//!   DER CRL/OCSP status sources and ALPN.
-//! * [`cert_status`] - bounded DER CRL/BasicOCSPResponse parsing and status checks.
+//!   client-certificate mTLS, a static fingerprint deny list, local DER
+//!   CRL/OCSP status sources, an HTTP CRL distribution point and ALPN.
+//! * [`cert_status`] - bounded DER CRL/BasicOCSPResponse parsing, std-only
+//!   HTTP CRL retrieval with a URL-keyed cache and status checks.
 //! * [`websocket`] - the RFC 6455 frame codec, server channel and client.
 //! * [`ssr`] - deterministic server-side HTML rendering of the same IR tree.
 //! * [`ir`] - the full-stack IR v0.1 data model.

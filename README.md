@@ -6,7 +6,8 @@ isolation, a deterministic SSR host, hardening (pooled SQLite, fixed-window
 rate limiting, structured logs), opt-in HTTP features (bearer auth, gzip,
 ETag, CORS), opt-in transport features (TLS, WebSocket, HTTP/1.1 keep-alive),
 opt-in mutual TLS with a static certificate revocation deny list and ALPN
-reporting, opt-in static local DER CRL/OCSP certificate status checks, and
+reporting, opt-in DER CRL/OCSP certificate status checks from local files or
+an HTTP CRL distribution point with a refreshable cache, and
 `opurom-serverc`, the compiler that lowers a full-stack IR into a standalone
 Rust service crate.
 
@@ -55,7 +56,7 @@ The transport layer wraps that core:
 ```
 accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
            OPR_MTLS=1: require a client certificate, apply the static deny list
-            and every required local DER CRL/OCSP status source
+            and every required DER CRL/OCSP status source (local or HTTP)
            ALPN: advertise h2/http/1.1, report the selected protocol
         -> h2: http2::serve (HEADERS/DATA, HPACK, streams, flow control, GOAWAY)
            -> same middleware/router/response features
@@ -74,8 +75,8 @@ accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
 | `middleware` | `MiddlewareChain`, `RateLimiter`, logging helpers, body cap, opt-in HTTP options |
 | `router` | route table, `:param` matching, panic isolation, 3-strike breaker |
 | `server` | `TcpListener` accept loop, one thread per connection, optional TLS, ALPN-selected HTTP/2, optional keep-alive, optional WebSocket upgrade, opt-in response features and measured JSON log |
-| `tls` | the optional TLS listener: environment configuration, PEM loading, self-signed fallback, SHA-256 fingerprint, opt-in client-certificate mTLS, static fingerprint deny list, required local DER CRL/OCSP status sources and ALPN |
-| `cert_status` | bounded DER CRL/BasicOCSPResponse parsing, CA signature checks, serial matching, freshness checks and fail-closed status decisions |
+| `tls` | the optional TLS listener: environment configuration, PEM loading, self-signed fallback, SHA-256 fingerprint, opt-in client-certificate mTLS, static fingerprint deny list, local DER CRL/OCSP status sources, HTTP CRL distribution point configuration and ALPN |
+| `cert_status` | bounded DER CRL/BasicOCSPResponse parsing, CA signature checks, serial matching, freshness checks, std-only HTTP CRL retrieval with a URL-keyed cache and fail-closed status decisions |
 | `websocket` | the RFC 6455 frame codec with size limits, the server channel and the client helper |
 | `ssr` | deterministic HTML rendering of the IR tree with theme tokens |
 | `ir` | IR v0.1 model: state, tree, theme, models, api |
@@ -112,10 +113,11 @@ handler is caught, and no failure path aborts the process.
   frames, preserve status, body and the opt-in HTTP headers, set an exact
   `Content-Length` and omit HTTP/1.1 `Connection` headers. Plain HTTP, no
   ALPN and `http/1.1` ALPN keep the HTTP/1.1 wire bytes.
-* The certificate status sources are opt-in too. With neither `OPR_CRL_FILE`
-  nor `OPR_OCSP_FILE` set, the mTLS handshake and HTTP/1.1 response bytes stay
-  identical. With either set, that local DER source is required for every mTLS
-  handshake and any unavailable or unusable source refuses the connection.
+* The certificate status sources are opt-in too. With none of `OPR_CRL_FILE`,
+  `OPR_OCSP_FILE` and `OPR_CRL_URL` set, the mTLS handshake and HTTP/1.1
+  response bytes stay identical. Each configured source is required for every
+  mTLS handshake and any unavailable or unusable source refuses the
+  connection. `OPR_CRL_FILE` takes precedence over `OPR_CRL_URL`.
 
 | Situation | Status | Body |
 | --- | --- | --- |
@@ -395,9 +397,10 @@ Both values are settable in code with `Server::with_idle_timeout` and
 
 * **Client certificates are a separate opt-in**: the transport variables alone
   never ask for a client certificate. See the mutual-TLS section below.
-* **The status sources are local files**: they are required static local DER
-  CRL/OCSP sources, not OCSP stapling, a CRL distribution point, a live
-  responder or distributed revocation. See the certificate-status section
+* **The CRL distribution point uses HTTP**: `OPR_CRL_URL` fetches a DER CRL
+  with bounded connect and read timeouts, a bounded response size and strict
+  status and `Content-Length` handling; the DER is cached per URL and
+  refreshed after `OPR_CRL_TTL_SECS`. See the certificate-status section
   below.
 * **No HSM and no cipher-suite tuning**: the cipher suites and the protocol
   versions are the `rustls` library defaults. There is no configuration for
@@ -453,7 +456,7 @@ is refused with an `unknown_ca` alert. The server writes a concrete line to
 stderr, for example:
 
 ```
-[opurom-server] mTLS handshake refused: client certificate missing, untrusted, revoked or status unavailable (check OPR_CLIENT_CA, OPR_REVOKED, OPR_CRL_FILE and OPR_OCSP_FILE): peer sent no certificates
+[opurom-server] mTLS handshake refused: client certificate missing, untrusted, revoked or status unavailable (check OPR_CLIENT_CA, OPR_REVOKED, OPR_CRL_FILE, OPR_CRL_URL and OPR_OCSP_FILE): peer sent no certificates
 ```
 
 A trusted client receives the negotiated response: unchanged HTTP/1.1 for
@@ -473,11 +476,10 @@ a match. The fingerprint is computed from the presented peer certificate DER,
 never from an HTTP header or another client-supplied string. A test proves
 that a spoofed `X-Client-Cert-Fingerprint` header does not bypass the list.
 
-**The deny list itself is NOT OCSP, OCSP stapling, a distributed CRL, a CRL
-distribution point or any network fetch.** The separate required static local
-DER CRL/OCSP status sources do not give this fingerprint list live status,
-expiry or distribution. An invalid fingerprint is a startup error rather than
-a silently ignored entry.
+`OPR_REVOKED` is a process-local list of presented certificate fingerprints.
+The DER CRL/OCSP sources and the HTTP CRL distribution point are separate
+checks applied after rustls verifies the chain. An invalid fingerprint is a
+startup error rather than a silently ignored entry.
 
 ### ALPN negotiation and reporting
 
@@ -499,13 +501,12 @@ completed h2 stream writes the same structured log fields with `"alpn":"h2"`.
 * The HTTP/2 implementation covers HPACK, HEADERS/DATA frames, streams and
   flow control. The HTTP/3 implementation covers QUIC transport, the HTTP/3
   frame layer and QPACK header compression on a separate UDP listener.
-* The certificate status sources are the required static local DER CRL/OCSP
-  checks; there is no OCSP stapling, CRL fetch, distributed revocation,
-  certificate status protocol or revocation cache.
-* No HSM, no private-key isolation, no certificate transparency, no SCT
-  validation and no cipher-suite tuning beyond the rustls defaults.
-* The client CA and the deny list are static, process-local configuration;
-  there is no identity store, no per-client authorization and no rotation.
+* The required status sources are local DER CRL/OCSP files and an HTTP CRL
+  distribution point whose DER is cached per URL and refreshed on an interval.
+  Every handshake verifies the CRL signature, issuer and freshness before a
+  serial is accepted.
+* The cipher suites and protocol versions are the rustls defaults.
+* The client CA and the deny list are process-local configuration.
 
 ## Real HTTP/2 (ALPN-selected)
 
@@ -651,25 +652,30 @@ below is measured with `std::time::Instant` during the run that produced it:
 ## Certificate status (opt-in)
 
 Real certificate status checks run on the same rustls mTLS listener. They do
-not replace the fingerprint deny list and they fetch nothing: status sources
-are local DER files named at startup and read again at each handshake. With
-neither variable set, the mTLS path is unchanged, including byte-identical
-HTTP/1.1 answers.
+not replace the fingerprint deny list. Local DER files named at startup are
+read again at each handshake. `OPR_CRL_URL` retrieves a DER CRL from an HTTP
+distribution point and keeps it in a URL-keyed cache. With none of these
+variables set, the mTLS path is unchanged, including byte-identical HTTP/1.1
+answers.
 
 | Variable | Effect |
 | --- | --- |
-| `OPR_CRL_FILE` | required local DER X.509 v2 CRL |
+| `OPR_CRL_FILE` | required local DER X.509 v2 CRL; takes precedence over `OPR_CRL_URL` |
+| `OPR_CRL_URL` | `http://` CRL distribution point, or the literal `cert` to read the first URI of the client certificate's CRL Distribution Points extension |
+| `OPR_CRL_TTL_SECS` | cache refresh interval in seconds (fractional values allowed); default `3600` |
 | `OPR_OCSP_FILE` | required local DER `BasicOCSPResponse` |
 
-Both variables are read only when `OPR_MTLS=1`. A configured source is
-required: a missing, unreadable, empty or oversized file, malformed DER, an
-unverifiable signature, a mismatched issuer, a stale `nextUpdate`, a future
+All four variables are read only when `OPR_MTLS=1`. A configured source is
+required: a missing, unreadable, empty or oversized file, a failed or
+malformed distribution-point response, malformed DER, an unverifiable
+signature, a mismatched issuer, a stale `nextUpdate`, a future
 `thisUpdate`/`producedAt`, an OCSP `unknown` status or a serial with no OCSP
 entry refuses the handshake. A CRL that names the presented client serial or
 an OCSP `revoked` status refuses it; a non-revoked CRL entry and/or an OCSP
 `good` status lets the already-verified chain complete.
 
-The CRL is parsed with `x509-parser` 0.18.1. The OCSP response uses a strict,
+The CRL is parsed with `x509-parser` 0.18.1, including the CRL Distribution
+Points extension of the presented certificate. The OCSP response uses a strict,
 definite-length DER reader for `BasicOCSPResponse`, `ResponseData`,
 `SingleResponse`, `CertID` and `CertStatus` (`good` / `revoked` / `unknown`).
 SHA-256 `CertID` hashes of the CA subject Name and subject public key are
@@ -677,22 +683,34 @@ compared with the configured `OPR_CLIENT_CA`, and both CRL and OCSP signatures
 are verified against that CA's public key through `x509-parser`'s
 `ring`-backed verifier. Serials are compared as canonical positive DER
 INTEGERs. Every DER input is capped at `cert_status::MAX_STATUS_DER_BYTES`
-(256 KiB); files are read through a bounded `take`, serials at 20 octets,
-OCSP responses at 64 `SingleResponse` entries, and indefinite or non-minimal
-DER lengths are rejected before slicing.
+(256 KiB); local files are read through a bounded `take`, HTTP responses are
+bounded by `Content-Length`, serials at 20 octets, OCSP responses at 64
+`SingleResponse` entries, and indefinite or non-minimal DER lengths are
+rejected before slicing.
+
+The HTTP client is a `std::net::TcpStream` GET with a 3-second connect
+timeout, 3-second read/write timeouts and a total response deadline, a
+required `200` status, exactly one `Content-Length` header and no chunked
+transfer. Fetched DER is cached in a `Mutex`-guarded, URL-keyed map with at
+most 16 entries, each capped at 256 KiB. A fresh entry is used without a
+request; an expired one is refetched; a failed fetch with no fresh cached copy
+refuses the handshake with a clear error. Cached DER still goes through the CA
+signature, issuer and freshness checks on every handshake. URLs use the
+`http://` scheme.
 
 Tests generate a CA, a CA-signed server chain, two CA-signed clients, DER CRLs
 and CA-signed OCSP responses with `rcgen` in memory; local DER files are
-written only under the ignored `target/` tree at test runtime. A
-revoked-but-otherwise-trusted client is refused over a real socket, a good
-client gets `200`, and missing, malformed, stale, tampered, oversized and
-unknown-status sources all fail closed. No private keys are checked in.
+written only under the ignored `target/` tree at test runtime. A revoked,
+stale, malformed, tampered or oversized source is refused over a real socket
+and a good client gets `200`. The live-CRL tests run a loopback HTTP server on
+`127.0.0.1:0` and measure its request counts: the first handshake fetches, a
+second handshake inside the refresh interval makes no request, an expired
+entry refetches, a fresh cached CRL works with the server stopped, and an
+absent or expired copy with the server stopped fails closed. No private keys
+are checked in.
 
-The status sources are static local files only: there is no live OCSP
-responder fetch, no CRL distribution point fetch, no OCSP stapling, no
-delegated OCSP responder certificates, no status cache, no nonce, no
-certificate transparency/SCT validation, no distributed revocation, no
-HSM/private-key isolation and no cipher-suite tuning.
+Additional distribution and transparency transports are listed under Future
+directions.
 
 ## Generated service (`opurom-serverc`)
 
@@ -726,9 +744,10 @@ The generator writes a standalone crate into `<dir>`:
   through the runtime described above. The transport variables `OPR_TLS`,
   `OPR_TLS_CERT`, `OPR_TLS_KEY`, `OPR_KEEPALIVE` and `OPR_WEBSOCKET` work the
   same way. The mutual-TLS variables `OPR_MTLS`, `OPR_CLIENT_CA` and
-  `OPR_REVOKED` work the same way too. The status variables `OPR_CRL_FILE` and
-  `OPR_OCSP_FILE` are required local DER sources on those mTLS listeners. h2 is
-  selected by ALPN on those TLS listeners; it needs no new variable.
+  `OPR_REVOKED` work the same way too. The status variables `OPR_CRL_FILE`,
+  `OPR_OCSP_FILE`, `OPR_CRL_URL` and `OPR_CRL_TTL_SECS` configure the DER
+  status sources on those mTLS listeners. h2 is selected by ALPN on those TLS
+  listeners; it needs no new variable.
 * The schema is created at startup inside one `PooledDb::with` call: every
   `migrations/*.sql` statement is embedded with `include_str!` and executed
   (they are `CREATE TABLE IF NOT EXISTS`, so startup is idempotent).
@@ -819,9 +838,10 @@ port over TCP:
 | `tests/keepalive.rs` | two requests on one socket, a `Connection: close` request ending the connection, the idle timeout closing a silent connection, the in-flight limit answering 503, the documented default limits, the demo server with and without `OPR_KEEPALIVE` |
 | `tests/mtls.rs` | real sockets with an rcgen CA -> server chain -> client cert chain, `OPR_MTLS=1` alone enabling TLS, a trusted client accepted, missing and self-signed untrusted clients refused, a revoked-but-trusted cert refused and a non-revoked one accepted, a spoofed fingerprint header ignored, `h2`/`http/1.1` ALPN selection with a real h2 client for `h2`, the structured log `alpn` field, clear mTLS refusal diagnostics, and the byte-identical single-sided TLS answer |
 | `tests/http2.rs` | `h2_concurrent_streams_share_one_tls_connection`, `h2_large_body_flow_control_isolates_failed_stream` and `h2_shutdown_sends_graceful_goaway`: one real h2 client connection with several concurrent streams, exact statuses/bodies and the opt-in response features, 256 KiB response and 128 KiB request across flow-control windows, panic isolation, and raw-frame initial/final GOAWAY with PING/PONG |
-| `src/cert_status.rs` | DER GeneralizedTime, canonical serial and strict DER-length unit tests |
+| `src/cert_status.rs` | DER GeneralizedTime, canonical serial, strict DER-length, HTTP URL validation, HTTP status/framing bounds and CRL Distribution Points extension unit tests |
 | `tests/cert_status.rs` | real mTLS sockets with rcgen CRL/OCSP fixtures: `crl_revoked_serial_is_refused_and_good_client_is_accepted`, `crl_stale_or_tampered_der_fails_closed`, `crl_malformed_or_oversized_der_fails_closed`, `ocsp_good_status_is_accepted_and_revoked_status_is_refused`, `ocsp_unknown_and_wrong_serial_fail_closed`, `ocsp_stale_or_tampered_response_fails_closed`, `ocsp_empty_env_value_fails_closed`, `ocsp_unavailable_or_malformed_file_fails_closed`, both-sources-required and byte-identical default checks |
 | `tests/status_env.rs` | `crl_and_ocsp_env_files_configure_mtls`: `OPR_CRL_FILE`/`OPR_OCSP_FILE` local DER files over a real mTLS socket, with missing sources failing closed |
+| `tests/crl_live.rs` | a loopback HTTP/1.1 distribution point with measured request counts: `live_crl_url_fetches_caches_refreshes_and_fails_closed`, `live_crl_without_cache_and_without_server_fails_closed`, `live_crl_url_keeps_signature_freshness_and_serial_checks`, `crl_file_takes_precedence_over_crl_url`, `crl_url_from_certificate_extension_fetches_and_caches` and `invalid_crl_url_or_ttl_is_a_startup_error` |
 
 The in-process tests are self-contained: they use an in-memory store, not
 `opurom-db`, so `cargo test` passes in this repository on its own. The
@@ -852,8 +872,9 @@ Implemented and verified in this repository:
 | Real HTTP/2 | Implemented, ALPN-selected `h2` only, h2 0.4.20 frames/HPACK/multiplexing/flow control, shared router/middleware, bounded limits and graceful GOAWAY; no new environment variable |
 | Real HTTP/3 over QUIC | Implemented, opt-in via `OPR_HTTP3=1`, a separate UDP listener with TLS 1.3 and ALPN `h3`, real h3 request/response exchange, shared router/middleware/fault isolation, `Alt-Svc` advertisement on the HTTPS responses |
 | Mutual TLS client certificates | Implemented, opt-in via `OPR_MTLS=1` + `OPR_CLIENT_CA`, mandatory rustls verification over real sockets |
-| Certificate revocation | Implemented as a static `OPR_REVOKED` fingerprint deny list plus required static local DER CRL/OCSP serial status checks |
-| Static local certificate status | Implemented, opt-in via `OPR_CRL_FILE` / `OPR_OCSP_FILE`, CA-signature-verified, bounded DER parsing, fail-closed on unavailable/malformed/stale sources |
+| Certificate revocation | Implemented as a static `OPR_REVOKED` fingerprint deny list plus required DER CRL/OCSP serial status checks |
+| Local certificate status | Implemented, opt-in via `OPR_CRL_FILE` / `OPR_OCSP_FILE`, CA-signature-verified, bounded DER parsing, fail-closed on unavailable/malformed/stale sources |
+| Live CRL retrieval with cache | Implemented, opt-in via `OPR_CRL_URL` (an `http://` URL or the certificate CRL Distribution Points extension), std-only HTTP client with bounded timeouts and response size, URL-keyed cache refreshed by `OPR_CRL_TTL_SECS`, fail-closed with a clear error when no valid copy exists |
 | ALPN negotiation and reporting | Implemented, `h2` and `http/1.1` advertised, selected protocol in the structured log; h2 frames are served when `h2` is selected |
 | WebSocket (RFC 6455) | Implemented, opt-in via `OPR_WEBSOCKET=1`, handshake, text, binary, ping/pong, close and fragmentation, bounded frames |
 | HTTP/1.1 keep-alive | Implemented, opt-in via `OPR_KEEPALIVE=1`, `Content-Length` framing, idle timeout, in-flight limit |
@@ -865,8 +886,7 @@ Out of scope for this repository:
 | HTTP/3 server push and WebTransport | the HTTP/3 implementation covers the request/response exchange; no push promises and no WebTransport sessions |
 | HTTP/2 server push, priority tree and coalescing | no push promises, no client-controlled priority tree and no cross-origin connection reuse |
 | HTTP/2 extended CONNECT, WebSocket-over-h2, trailers | the RFC 6455 upgrade remains HTTP/1.1 only |
-| Live OCSP responder fetch / distributed revocation | the required status sources are static local DER files |
-| HSM and certificate transparency | no private-key isolation, no SCT validation |
+| HSM and private-key isolation | the private key is loaded from PEM or generated in memory |
 | `permessage-deflate` | no extension is negotiated, no frame is compressed |
 | Load-balancer integration | no `X-Forwarded-*`, no `Forwarded`, no proxy protocol |
 | Authentication provider / token lifecycle | the development bearer token only |
@@ -877,3 +897,10 @@ Out of scope for this repository:
 | Per-route CORS, credentialed CORS | one fixed configured origin or `*`; no cookies or credentials |
 | Application streaming and compression dictionaries | whole-body gzip only; each response is built in memory before h2 DATA frames |
 | Chunked HTTP/1.1 request bodies | `Transfer-Encoding` is rejected with 501; h2 uses DATA frames |
+
+## Future directions
+
+* HTTPS CRL distribution points
+* OCSP stapling
+* Distributed revocation
+* Certificate Transparency

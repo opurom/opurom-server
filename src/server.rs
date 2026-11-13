@@ -10,9 +10,9 @@
 //! `OPR_MTLS=1` adds opt-in client certificates, the `OPR_REVOKED` static
 //! fingerprint deny list and ALPN reporting. HTTP/2 is served when ALPN
 //! selects `h2`; every other connection keeps the HTTP/1.1 path. The
-//! `OPR_CRL_FILE` and `OPR_OCSP_FILE` variables add required static local DER
-//! CRL/OCSP status sources to the mTLS handshake. No new environment variable
-//! enables HTTP/2.
+//! `OPR_CRL_FILE`, `OPR_CRL_URL` and `OPR_OCSP_FILE` variables add required
+//! certificate status sources to the mTLS handshake. No new environment
+//! variable enables HTTP/2.
 //!
 //! With none of the mTLS variables set, no client ALPN offer and no `h2`
 //! negotiation, the plain-TLS wire format and response bytes stay identical.
@@ -430,10 +430,11 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
     let report_handshake_error = |err: &std::io::Error| {
         if requires_client_auth {
             eprintln!(
-                "[opurom-server] mTLS handshake refused: client certificate missing, untrusted, revoked or status unavailable (check {}, {}, {} and {}): {}",
+                "[opurom-server] mTLS handshake refused: client certificate missing, untrusted, revoked or status unavailable (check {}, {}, {}, {} and {}): {}",
                 tls::CLIENT_CA_ENV,
                 tls::REVOKED_ENV,
                 tls::CRL_FILE_ENV,
+                tls::CRL_URL_ENV,
                 tls::OCSP_FILE_ENV,
                 err
             );

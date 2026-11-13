@@ -68,6 +68,17 @@ enum OcspFixtureStatus {
 /// Generate a CA, a CA-signed server chain and two CA-signed clients, then
 /// derive all CRL and OCSP status fixtures from the same keys and serials.
 pub fn fixture() -> Fixture {
+    build(None)
+}
+
+/// The same fixture with a CRL Distribution Points extension on the trusted
+/// client certificate, naming `url`.
+#[allow(dead_code)]
+pub fn fixture_with_crl_dp(url: &str) -> Fixture {
+    build(Some(url))
+}
+
+fn build(dp_url: Option<&str>) -> Fixture {
     let mut ca_params = CertificateParams::default();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params
@@ -86,6 +97,7 @@ pub fn fixture() -> Fixture {
         vec!["localhost".to_string(), "127.0.0.1".to_string()],
         ExtendedKeyUsagePurpose::ServerAuth,
         2,
+        None,
     );
     let (trusted_cert, trusted_key) = signed_leaf(
         &issuer,
@@ -93,6 +105,7 @@ pub fn fixture() -> Fixture {
         vec!["trusted.example".to_string()],
         ExtendedKeyUsagePurpose::ClientAuth,
         3,
+        dp_url,
     );
     let (other_cert, other_key) = signed_leaf(
         &issuer,
@@ -100,6 +113,7 @@ pub fn fixture() -> Fixture {
         vec!["other.example".to_string()],
         ExtendedKeyUsagePurpose::ClientAuth,
         4,
+        None,
     );
 
     let ca_pem = ca_cert.pem();
@@ -178,6 +192,7 @@ fn signed_leaf<S: SigningKey>(
     names: Vec<String>,
     eku: ExtendedKeyUsagePurpose,
     serial: u64,
+    dp_url: Option<&str>,
 ) -> (rcgen::Certificate, KeyPair) {
     let mut params = CertificateParams::new(names).expect("leaf parameters");
     params.serial_number = Some(SerialNumber::from(serial));
@@ -187,9 +202,21 @@ fn signed_leaf<S: SigningKey>(
     params.key_usages.push(KeyUsagePurpose::DigitalSignature);
     params.extended_key_usages.push(eku);
     params.use_authority_key_identifier_extension = true;
+    if let Some(url) = dp_url {
+        params.custom_extensions.push(crl_dp_extension(url));
+    }
     let key = KeyPair::generate().expect("leaf key");
     let cert = params.signed_by(&key, issuer).expect("leaf certificate");
     (cert, key)
+}
+
+/// CRLDistributionPoints ::= { DistributionPoint { [0] { [0] { [6] URI } } } }
+fn crl_dp_extension(url: &str) -> rcgen::CustomExtension {
+    let content = tlv(
+        0x30,
+        &tlv(0x30, &tlv(0xa0, &tlv(0xa0, &tlv(0x86, url.as_bytes())))),
+    );
+    rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 31], content)
 }
 
 fn signed_identity(cert: &rcgen::Certificate, key: &KeyPair, ca_pem: &str) -> ClientIdentity {

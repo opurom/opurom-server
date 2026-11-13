@@ -1,25 +1,36 @@
-//! Static local certificate status sources for the opt-in mTLS path.
+//! Certificate status sources for the opt-in mTLS path.
 //!
-//! `OPR_CRL_FILE` and `OPR_OCSP_FILE` name local DER files; there is no network
-//! fetch, responder, certificate transparency log or distributed revocation.
-//! The DER CRL is parsed by `x509-parser`. `BasicOCSPResponse` is read by a
-//! small strict DER reader because this crate has no generic ASN.1 dependency.
-//! Both sources are cryptographically checked against the configured client
-//! CA certificates and are re-read and checked on every handshake. Every
-//! input is capped before parsing; any unavailable, malformed, stale,
-//! unauthenticated or unknown source refuses the handshake.
+//! `OPR_CRL_FILE` and `OPR_OCSP_FILE` name local DER files. `OPR_CRL_URL`
+//! names an HTTP CRL distribution point, or `cert` to read the CRL
+//! Distribution Points extension of the presented certificate. A fetched DER
+//! CRL is kept in a URL-keyed, size-bounded cache with a refresh interval.
+//! `OPR_CRL_FILE` takes precedence over a configured URL. The HTTP client is
+//! `std::net::TcpStream` with a minimal GET; the DER CRL is parsed by
+//! `x509-parser`. `BasicOCSPResponse` is read by a small strict DER reader
+//! because this crate has no generic ASN.1 dependency. Both sources are
+//! cryptographically checked against the configured client CA certificates
+//! and are re-read and checked on every handshake. Every input is capped
+//! before parsing; any unavailable, malformed, stale, unauthenticated or
+//! unknown source refuses the handshake.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::env::VarError;
 use std::fmt;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::CertificateDer;
 use sha2::{Digest, Sha256};
 use x509_parser::asn1_rs::{BitString, FromDer};
-use x509_parser::prelude::{parse_x509_certificate, parse_x509_crl, AlgorithmIdentifier};
+use x509_parser::prelude::{
+    parse_x509_certificate, parse_x509_crl, AlgorithmIdentifier, DistributionPointName,
+    GeneralName, ParsedExtension,
+};
 use x509_parser::revocation_list::CertificateRevocationList;
 use x509_parser::verify::verify_signature;
 use x509_parser::x509::SubjectPublicKeyInfo;
@@ -27,11 +38,19 @@ use x509_parser::x509::SubjectPublicKeyInfo;
 /// Maximum size of one DER certificate, CRL or OCSP response.
 pub const MAX_STATUS_DER_BYTES: usize = 256 * 1024;
 
+/// Default refresh interval of a fetched CRL, in seconds.
+pub const DEFAULT_CRL_TTL_SECS: u64 = 3600;
+
 /// RFC 5280 requires support for serial numbers of up to 20 octets.
 const MAX_SERIAL_BYTES: usize = 20;
 const MAX_OCSP_SINGLE_RESPONSES: usize = 64;
 const CLOCK_SKEW_SECS: u64 = 60;
 const SHA256_OID: &str = "2.16.840.1.101.3.4.2.1";
+const CRL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const CRL_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_CRL_URL_BYTES: usize = 2048;
+const MAX_CRL_HEADERS_BYTES: usize = 8 * 1024;
+const MAX_CACHED_CRL_URLS: usize = 16;
 
 /// A certificate status refusal. The message is written for an operator.
 #[derive(Clone, Debug)]
@@ -55,7 +74,40 @@ impl std::error::Error for StatusError {}
 enum StatusSourceKind {
     Bytes(Vec<u8>),
     File(PathBuf),
+    Url(Arc<CrlFetcher>),
     Unavailable(String),
+}
+
+/// A parsed, validated `http://` distribution point.
+#[derive(Clone, Debug)]
+struct HttpUrl {
+    raw: String,
+    authority: String,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+#[derive(Debug)]
+enum CrlTarget {
+    Explicit(HttpUrl),
+    Certificate,
+}
+
+#[derive(Debug)]
+struct CachedCrl {
+    der: Vec<u8>,
+    fetched_at: Instant,
+}
+
+/// A URL-keyed cache of DER CRLs fetched over HTTP, shared by all clones of
+/// one status source so a refresh does not happen on every handshake.
+#[derive(Debug)]
+struct CrlFetcher {
+    label: &'static str,
+    target: CrlTarget,
+    ttl: Duration,
+    cache: Mutex<HashMap<String, CachedCrl>>,
 }
 
 /// One required status source, with the name of its environment variable.
@@ -82,6 +134,36 @@ impl StatusSource {
         }
     }
 
+    /// A CRL distribution point fetched over HTTP and cached for `ttl`.
+    pub fn crl_url(
+        label: &'static str,
+        url: &str,
+        ttl: Duration,
+    ) -> Result<StatusSource, StatusError> {
+        Ok(StatusSource {
+            label,
+            kind: StatusSourceKind::Url(Arc::new(CrlFetcher {
+                label,
+                target: CrlTarget::Explicit(parse_http_url(url)?),
+                ttl,
+                cache: Mutex::new(HashMap::new()),
+            })),
+        })
+    }
+
+    /// Fetch from the CRL Distribution Points extension of the client cert.
+    pub fn crl_url_from_certificate(label: &'static str, ttl: Duration) -> StatusSource {
+        StatusSource {
+            label,
+            kind: StatusSourceKind::Url(Arc::new(CrlFetcher {
+                label,
+                target: CrlTarget::Certificate,
+                ttl,
+                cache: Mutex::new(HashMap::new()),
+            })),
+        }
+    }
+
     /// A status source that is known to be unavailable.
     pub fn unavailable(label: &'static str, message: impl Into<String>) -> StatusSource {
         StatusSource {
@@ -95,10 +177,11 @@ impl StatusSource {
         self.label
     }
 
-    fn load(&self) -> Result<Cow<'_, [u8]>, StatusError> {
+    fn load(&self, cert_der: &[u8]) -> Result<Cow<'_, [u8]>, StatusError> {
         match &self.kind {
             StatusSourceKind::Bytes(bytes) => Ok(Cow::Borrowed(bytes.as_slice())),
             StatusSourceKind::File(path) => Ok(Cow::Owned(read_bounded_file(path, self.label)?)),
+            StatusSourceKind::Url(fetcher) => Ok(Cow::Owned(fetcher.load(cert_der)?)),
             StatusSourceKind::Unavailable(message) => Err(StatusError::new(message.clone())),
         }
     }
@@ -126,6 +209,58 @@ pub fn status_source_from_env(name: &'static str) -> Option<StatusSource> {
             format!("{} is not valid UTF-8", name),
         )),
     }
+}
+
+/// Read the opt-in live CRL configuration. Call this only when no local CRL
+/// file is configured: `OPR_CRL_FILE` takes precedence over a distribution URL.
+pub fn crl_url_source_from_env(
+    url_name: &'static str,
+    ttl_name: &'static str,
+) -> Result<Option<StatusSource>, StatusError> {
+    let raw = match std::env::var(url_name) {
+        Ok(raw) => raw.trim().to_string(),
+        Err(VarError::NotPresent) => return Ok(None),
+        Err(VarError::NotUnicode(_)) => {
+            return Ok(Some(StatusSource::unavailable(
+                url_name,
+                format!("{} is not valid UTF-8", url_name),
+            )))
+        }
+    };
+    if raw.is_empty() {
+        return Ok(Some(StatusSource::unavailable(
+            url_name,
+            format!("{} is empty", url_name),
+        )));
+    }
+    let ttl = crl_ttl_from_env(ttl_name)?;
+    if raw == "cert" {
+        Ok(Some(StatusSource::crl_url_from_certificate(url_name, ttl)))
+    } else {
+        Ok(Some(StatusSource::crl_url(url_name, &raw, ttl)?))
+    }
+}
+
+fn crl_ttl_from_env(name: &'static str) -> Result<Duration, StatusError> {
+    let raw = match std::env::var(name) {
+        Ok(raw) => raw,
+        Err(VarError::NotPresent) => return Ok(Duration::from_secs(DEFAULT_CRL_TTL_SECS)),
+        Err(VarError::NotUnicode(_)) => {
+            return Err(StatusError::new(format!("{} is not valid UTF-8", name)))
+        }
+    };
+    let secs: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| StatusError::new(format!("{} must be a positive number of seconds", name)))?;
+    if !secs.is_finite() || secs <= 0.0 {
+        return Err(StatusError::new(format!(
+            "{} must be a positive number of seconds",
+            name
+        )));
+    }
+    Duration::try_from_secs_f64(secs)
+        .map_err(|_| StatusError::new(format!("{} is out of range", name)))
 }
 
 fn read_bounded_file(path: &Path, label: &str) -> Result<Vec<u8>, StatusError> {
@@ -164,6 +299,329 @@ fn read_bounded_file(path: &Path, label: &str) -> Result<Vec<u8>, StatusError> {
         )));
     }
     Ok(bytes)
+}
+
+impl CrlFetcher {
+    /// Return the cached CRL when it is fresh, otherwise fetch it once.
+    /// A fetch failure falls back to a still-fresh cached copy and otherwise
+    /// refuses the handshake; a revoked serial is never accepted.
+    fn load(&self, cert_der: &[u8]) -> Result<Vec<u8>, StatusError> {
+        let url = match &self.target {
+            CrlTarget::Explicit(url) => url.clone(),
+            CrlTarget::Certificate => crl_distribution_url(cert_der)?,
+        };
+        if let Some(der) = self.cached(&url.raw) {
+            return Ok(der);
+        }
+        match fetch_crl(&url) {
+            Ok(der) => {
+                self.store(url.raw.clone(), &der);
+                Ok(der)
+            }
+            Err(err) => {
+                if let Some(der) = self.cached(&url.raw) {
+                    return Ok(der);
+                }
+                Err(StatusError::new(format!(
+                    "{}: CRL fetch from {} failed and no valid cached CRL is available: {}",
+                    self.label, url.raw, err
+                )))
+            }
+        }
+    }
+
+    fn cached(&self, key: &str) -> Option<Vec<u8>> {
+        let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        cache
+            .get(key)
+            .filter(|entry| entry.fetched_at.elapsed() < self.ttl)
+            .map(|entry| entry.der.clone())
+    }
+
+    fn store(&self, key: String, der: &[u8]) {
+        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        // shortcut: oldest-entry eviction instead of LRU; upgrade when many
+        // distribution points per CA become common.
+        if !cache.contains_key(&key) && cache.len() >= MAX_CACHED_CRL_URLS {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(
+            key,
+            CachedCrl {
+                der: der.to_vec(),
+                fetched_at: Instant::now(),
+            },
+        );
+    }
+}
+
+/// First HTTP URI in the CRL Distribution Points extension of a certificate.
+fn crl_distribution_url(cert_der: &[u8]) -> Result<HttpUrl, StatusError> {
+    checked_der(cert_der, "client certificate")?;
+    let (rem, cert) = parse_x509_certificate(cert_der)
+        .map_err(|_| StatusError::new("client certificate DER is malformed"))?;
+    if !rem.is_empty() {
+        return Err(StatusError::new(
+            "client certificate DER has trailing bytes",
+        ));
+    }
+    let mut seen = false;
+    let mut uris = Vec::new();
+    for extension in cert.extensions() {
+        if let ParsedExtension::CRLDistributionPoints(points) = extension.parsed_extension() {
+            if seen {
+                return Err(StatusError::new(
+                    "client certificate has duplicate CRL Distribution Points extensions",
+                ));
+            }
+            seen = true;
+            for point in points.iter() {
+                if let Some(DistributionPointName::FullName(names)) = &point.distribution_point {
+                    for name in names {
+                        if let GeneralName::URI(uri) = name {
+                            uris.push(*uri);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut last = None;
+    for uri in uris {
+        match parse_http_url(uri) {
+            Ok(url) => return Ok(url),
+            Err(err) => last = Some(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        StatusError::new(
+            "client certificate CRL Distribution Points extension carries no usable URI",
+        )
+    }))
+}
+
+/// Validate an `http://` distribution point. HTTPS distribution points are
+/// reported as unsupported rather than silently fetched or skipped.
+fn parse_http_url(raw: &str) -> Result<HttpUrl, StatusError> {
+    if raw.len() > MAX_CRL_URL_BYTES {
+        return Err(StatusError::new(format!(
+            "CRL distribution URL exceeds the {} byte limit",
+            MAX_CRL_URL_BYTES
+        )));
+    }
+    if raw.starts_with("https://") {
+        return Err(StatusError::new(
+            "HTTPS CRL distribution points are not supported; use an http:// URL",
+        ));
+    }
+    let rest = raw
+        .strip_prefix("http://")
+        .ok_or_else(|| StatusError::new("CRL distribution URL must use the http:// scheme"))?;
+    if !raw.is_ascii() || raw.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
+        return Err(StatusError::new(
+            "CRL distribution URL must be printable ASCII without spaces",
+        ));
+    }
+    if raw.contains('#') || raw.contains('?') {
+        return Err(StatusError::new(
+            "CRL distribution URL must not contain a query or fragment",
+        ));
+    }
+    let (authority, path) = match rest.find('/') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, "/"),
+    };
+    if authority.is_empty() || authority.contains('@') {
+        return Err(StatusError::new(
+            "CRL distribution URL must name a host without userinfo",
+        ));
+    }
+    let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
+        let end = stripped.find(']').ok_or_else(|| {
+            StatusError::new("CRL distribution URL has an unterminated IPv6 host")
+        })?;
+        let host = &stripped[..end];
+        let suffix = &stripped[end + 1..];
+        let port = match suffix.strip_prefix(':') {
+            Some(port) => parse_port(port)?,
+            None if suffix.is_empty() => 80,
+            None => {
+                return Err(StatusError::new(
+                    "CRL distribution URL has data after its IPv6 host",
+                ))
+            }
+        };
+        (host, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, parse_port(port)?),
+            None => (authority, 80),
+        }
+    };
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':'))
+    {
+        return Err(StatusError::new(
+            "CRL distribution URL host is not an IP literal or hostname",
+        ));
+    }
+    Ok(HttpUrl {
+        raw: raw.to_string(),
+        authority: authority.to_string(),
+        host: host.to_string(),
+        port,
+        path: path.to_string(),
+    })
+}
+
+fn parse_port(raw: &str) -> Result<u16, StatusError> {
+    let port = raw
+        .parse::<u16>()
+        .map_err(|_| StatusError::new("CRL distribution URL has an invalid port"))?;
+    if port == 0 {
+        return Err(StatusError::new("CRL distribution URL port must not be 0"));
+    }
+    Ok(port)
+}
+
+/// Fetch one DER CRL over HTTP with a std-only client. The connect and read
+/// timeouts, the response size and the status and framing are all bounded;
+/// every violation reports a clear error.
+/// shortcut: DNS resolution through `to_socket_addrs` has no deadline,
+/// upgrade when a resolver with a timeout is available.
+fn fetch_crl(url: &HttpUrl) -> Result<Vec<u8>, StatusError> {
+    let addr = (url.host.as_str(), url.port)
+        .to_socket_addrs()
+        .map_err(|err| StatusError::new(format!("cannot resolve CRL host {}: {}", url.host, err)))?
+        .next()
+        .ok_or_else(|| StatusError::new(format!("CRL host {} has no address", url.host)))?;
+    let mut stream = TcpStream::connect_timeout(&addr, CRL_CONNECT_TIMEOUT)
+        .map_err(|err| StatusError::new(format!("cannot connect to {}: {}", url.raw, err)))?;
+    stream
+        .set_read_timeout(Some(CRL_IO_TIMEOUT))
+        .map_err(|err| StatusError::new(format!("cannot bound the CRL socket read: {}", err)))?;
+    stream
+        .set_write_timeout(Some(CRL_IO_TIMEOUT))
+        .map_err(|err| StatusError::new(format!("cannot bound the CRL socket write: {}", err)))?;
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: application/pkix-crl\r\nConnection: close\r\n\r\n",
+        url.path, url.authority
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| StatusError::new(format!("cannot send the CRL request: {}", err)))?;
+    read_crl_response(&mut stream)
+}
+
+fn read_crl_response(stream: &mut TcpStream) -> Result<Vec<u8>, StatusError> {
+    let deadline = Instant::now() + CRL_IO_TIMEOUT;
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    let head_end = loop {
+        if let Some(position) = raw.windows(4).position(|part| part == b"\r\n\r\n") {
+            break position + 4;
+        }
+        if raw.len() > MAX_CRL_HEADERS_BYTES {
+            return Err(StatusError::new(format!(
+                "CRL response headers exceed the {} byte limit",
+                MAX_CRL_HEADERS_BYTES
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(StatusError::new("CRL response timed out"));
+        }
+        let read = stream
+            .read(&mut buf)
+            .map_err(|err| StatusError::new(format!("cannot read the CRL response: {}", err)))?;
+        if read == 0 {
+            return Err(StatusError::new("CRL response ended before its headers"));
+        }
+        raw.extend_from_slice(&buf[..read]);
+    };
+    let head = std::str::from_utf8(&raw[..head_end])
+        .map_err(|_| StatusError::new("CRL response headers are not valid UTF-8"))?;
+    let mut lines = head.split("\r\n");
+    let status = lines.next().unwrap_or_default();
+    let mut status_parts = status.split(' ');
+    let version = status_parts.next().unwrap_or_default();
+    let code = status_parts.next().unwrap_or_default();
+    if !(version == "HTTP/1.1" || version == "HTTP/1.0") || code != "200" {
+        return Err(StatusError::new(format!(
+            "CRL distribution point answered {}",
+            status
+        )));
+    }
+    let mut length: Option<usize> = None;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| StatusError::new("CRL response has a header without a colon"))?;
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(StatusError::new("chunked CRL responses are not supported"));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if length.is_some() {
+                return Err(StatusError::new(
+                    "CRL response has duplicate Content-Length headers",
+                ));
+            }
+            let value = value.trim();
+            if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(StatusError::new(
+                    "CRL response Content-Length is not a number",
+                ));
+            }
+            length =
+                Some(value.parse::<usize>().map_err(|_| {
+                    StatusError::new("CRL response Content-Length is out of range")
+                })?);
+        }
+    }
+    let length =
+        length.ok_or_else(|| StatusError::new("CRL response has no Content-Length header"))?;
+    if length == 0 || length > MAX_STATUS_DER_BYTES {
+        return Err(StatusError::new(format!(
+            "CRL response Content-Length {} is outside the 1..{} byte DER limit",
+            length, MAX_STATUS_DER_BYTES
+        )));
+    }
+    let mut body = raw[head_end..].to_vec();
+    if body.len() > length {
+        return Err(StatusError::new(
+            "CRL response body exceeds its Content-Length",
+        ));
+    }
+    while body.len() < length {
+        if Instant::now() >= deadline {
+            return Err(StatusError::new("CRL response timed out"));
+        }
+        let read = stream
+            .read(&mut buf)
+            .map_err(|err| StatusError::new(format!("cannot read the CRL body: {}", err)))?;
+        if read == 0 {
+            return Err(StatusError::new(
+                "CRL response ended before its Content-Length bytes",
+            ));
+        }
+        body.extend_from_slice(&buf[..read]);
+        if body.len() > length {
+            return Err(StatusError::new(
+                "CRL response body exceeds its Content-Length",
+            ));
+        }
+    }
+    Ok(body)
 }
 
 #[derive(Debug)]
@@ -228,7 +686,7 @@ impl StatusChecker {
             })?;
 
         if let Some(source) = &self.crl {
-            let der = source.load()?;
+            let der = source.load(cert_der)?;
             if crl_revokes(der.as_ref(), &client.serial, ca, now)
                 .map_err(|err| labeled(source.label(), err))?
             {
@@ -239,7 +697,7 @@ impl StatusChecker {
             }
         }
         if let Some(source) = &self.ocsp {
-            let der = source.load()?;
+            let der = source.load(cert_der)?;
             let status = ocsp_status(der.as_ref(), &client.serial, ca, now)
                 .map_err(|err| labeled(source.label(), err))?;
             match status {
@@ -808,5 +1266,213 @@ mod tests {
         assert!(indefinite.read(0x30).is_err());
         let mut padded = Der::new(&[0x30, 0x81, 0x01, 0x00]);
         assert!(padded.read(0x30).is_err());
+    }
+
+    /// One-loopback-request HTTP server for the fetch bounds.
+    fn serve(response: Vec<u8>) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept one request");
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(&response);
+        });
+        (addr, handle)
+    }
+
+    fn response(head: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = head.as_bytes().to_vec();
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn loopback_url(port: u16) -> HttpUrl {
+        parse_http_url(&format!("http://127.0.0.1:{}/crl", port)).expect("loopback URL")
+    }
+
+    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if content.len() < 0x80 {
+            out.push(content.len() as u8);
+        } else {
+            out.push(0x81);
+            out.push(content.len() as u8);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// A client certificate whose CRL Distribution Points extension names `uri`.
+    fn cert_with_distribution_point(uri: Option<&str>) -> Vec<u8> {
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().expect("CA key");
+        let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+        let mut params =
+            rcgen::CertificateParams::new(vec!["dp-client".to_string()]).expect("leaf params");
+        if let Some(uri) = uri {
+            // CRLDistributionPoints ::= { DistributionPoint { [0] { [0] { [6] URI } } } }
+            let content = tlv(
+                0x30,
+                &tlv(0x30, &tlv(0xa0, &tlv(0xa0, &tlv(0x86, uri.as_bytes())))),
+            );
+            params
+                .custom_extensions
+                .push(rcgen::CustomExtension::from_oid_content(
+                    &[2, 5, 29, 31],
+                    content,
+                ));
+        }
+        let key = rcgen::KeyPair::generate().expect("leaf key");
+        params
+            .signed_by(&key, &issuer)
+            .expect("leaf certificate")
+            .der()
+            .as_ref()
+            .to_vec()
+    }
+
+    #[test]
+    fn http_url_validation_rejects_non_http_schemes_and_hosts() {
+        let url = parse_http_url("http://127.0.0.1:8443/crl/example.crl").expect("valid URL");
+        assert_eq!(url.host, "127.0.0.1");
+        assert_eq!(url.port, 8443);
+        assert_eq!(url.authority, "127.0.0.1:8443");
+        assert_eq!(url.path, "/crl/example.crl");
+        assert_eq!(
+            parse_http_url("http://127.0.0.1/crl")
+                .expect("default")
+                .port,
+            80
+        );
+        for (bad, expected) in [
+            ("https://127.0.0.1/crl", "HTTPS"),
+            ("ftp://127.0.0.1/crl", "http://"),
+            ("http://user@127.0.0.1/crl", "userinfo"),
+            ("http://127.0.0.1:0/crl", "port"),
+            ("http://127.0.0.1:99999/crl", "invalid port"),
+            ("http://[::1/crl", "IPv6"),
+            ("http://127.0.0.1/cr l", "printable ASCII"),
+            ("http://127.0.0.1/crl?next=1", "query or fragment"),
+            ("http://127.0.0.1/crl#part", "query or fragment"),
+            ("http://[::1]junk/crl", "data after its IPv6 host"),
+        ] {
+            let err = parse_http_url(bad).expect_err(bad);
+            assert!(err.to_string().contains(expected), "{} -> {}", bad, err);
+        }
+        let long = format!("http://127.0.0.1/{}", "a".repeat(MAX_CRL_URL_BYTES));
+        assert!(parse_http_url(&long).is_err(), "URL length is capped");
+    }
+
+    #[test]
+    fn crl_fetch_rejects_bad_status_and_framing() {
+        let der = vec![0x30, 0x03, 0x02, 0x01, 0x01];
+        let good = response(
+            &format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/pkix-crl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                der.len()
+            ),
+            &der,
+        );
+        let (addr, handle) = serve(good);
+        assert_eq!(
+            fetch_crl(&loopback_url(addr.port())).expect("good fetch"),
+            der
+        );
+        handle.join().expect("good server thread");
+
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (
+                response(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+                    &[],
+                ),
+                "503",
+            ),
+            (
+                response("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", &der),
+                "no Content-Length",
+            ),
+            (
+                response(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+                    &der,
+                ),
+                "chunked",
+            ),
+            (
+                response(
+                    &format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        MAX_STATUS_DER_BYTES + 1
+                    ),
+                    &[],
+                ),
+                "byte DER limit",
+            ),
+            (
+                response(
+                    &format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        der.len() + 3
+                    ),
+                    &der,
+                ),
+                "before its Content-Length",
+            ),
+            (
+                response(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n",
+                    &der,
+                ),
+                "duplicate Content-Length",
+            ),
+        ];
+        for (reply, expected) in cases {
+            let (addr, handle) = serve(reply);
+            let err = fetch_crl(&loopback_url(addr.port())).expect_err(expected);
+            assert!(
+                err.to_string().contains(expected),
+                "{} -> {}",
+                expected,
+                err
+            );
+            handle.join().expect("server thread");
+        }
+    }
+
+    #[test]
+    fn oversized_body_that_exceeds_content_length_is_rejected() {
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n";
+        let (addr, handle) = serve(response(head, &[1, 2, 3, 4, 5, 6]));
+        let err = fetch_crl(&loopback_url(addr.port())).expect_err("body over Content-Length");
+        assert!(
+            err.to_string().contains("exceeds its Content-Length"),
+            "{}",
+            err
+        );
+        handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn crl_distribution_extension_uri_is_read_from_the_certificate() {
+        let url = crl_distribution_url(&cert_with_distribution_point(Some(
+            "http://127.0.0.1:65535/ca.crl",
+        )))
+        .expect("extension URI");
+        assert_eq!(url.host, "127.0.0.1");
+        assert_eq!(url.port, 65535);
+        assert_eq!(url.path, "/ca.crl");
+        let err = crl_distribution_url(&cert_with_distribution_point(Some(
+            "https://ca.example/crl",
+        )))
+        .expect_err("HTTPS URI");
+        assert!(err.to_string().contains("HTTPS"), "{}", err);
+        let err = crl_distribution_url(&cert_with_distribution_point(None))
+            .expect_err("missing extension");
+        assert!(err.to_string().contains("no usable URI"), "{}", err);
     }
 }
