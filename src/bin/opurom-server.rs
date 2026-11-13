@@ -30,7 +30,7 @@ const DEMO_IR: &str = r##"{
     ],
     "events": {}
   },
-  "theme": { "mode": "system", "accent": "#4F46E5", "radius": 12 }
+  "theme": { "mode": "system", "accent": "#097FEB", "radius": 12 }
 }"##;
 
 fn main() {

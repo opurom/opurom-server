@@ -101,7 +101,7 @@ impl Default for Theme {
     fn default() -> Self {
         Theme {
             mode: "system".to_string(),
-            accent: "#4F46E5".to_string(),
+            accent: "#097FEB".to_string(),
             radius: 12.0,
             tokens: Vec::new(),
         }
