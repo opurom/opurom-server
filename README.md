@@ -1,13 +1,14 @@
 # opurom-server
 
-OPUROM backend runtime: a small HTTP/1.1 server with ALPN-selected HTTP/2, a
-router with path parameters, per-route fault isolation, a deterministic SSR
-host, hardening (pooled SQLite, fixed-window rate limiting, structured logs),
-opt-in HTTP features (bearer auth, gzip, ETag, CORS), opt-in transport
-features (TLS, WebSocket, HTTP/1.1 keep-alive), opt-in mutual TLS with a
-static certificate revocation deny list and ALPN reporting, opt-in static
-local DER CRL/OCSP certificate status checks, and `opurom-serverc`, the
-compiler that lowers a full-stack IR into a standalone Rust service crate.
+OPUROM backend runtime: a small HTTP/1.1 server with ALPN-selected HTTP/2 and
+opt-in HTTP/3 over QUIC, a router with path parameters, per-route fault
+isolation, a deterministic SSR host, hardening (pooled SQLite, fixed-window
+rate limiting, structured logs), opt-in HTTP features (bearer auth, gzip,
+ETag, CORS), opt-in transport features (TLS, WebSocket, HTTP/1.1 keep-alive),
+opt-in mutual TLS with a static certificate revocation deny list and ALPN
+reporting, opt-in static local DER CRL/OCSP certificate status checks, and
+`opurom-serverc`, the compiler that lowers a full-stack IR into a standalone
+Rust service crate.
 
 This crate implements the backend half of
 [`FULLSTACK_SPEC.md`](../opurom-spec/FULLSTACK_SPEC.md) sections 4-5,
@@ -17,15 +18,18 @@ section 6,
 [`NATIVE_NETWORK.md`](../opurom-spec/NATIVE_NETWORK.md) sections 1 and 5,
 [`BROWSER_AND_NATIVE_SURFACES.md`](../opurom-spec/BROWSER_AND_NATIVE_SURFACES.md)
 section 4,
-[`PRODUCTION_BREADTH.md`](../opurom-spec/PRODUCTION_BREADTH.md) section 2 and
+[`PRODUCTION_BREADTH.md`](../opurom-spec/PRODUCTION_BREADTH.md) section 2,
 [`COMPONENT_LIBRARY_HARDENING.md`](../opurom-spec/COMPONENT_LIBRARY_HARDENING.md)
-section 5.
+section 5 and
+[`TRANSPORT_AND_LANGUAGE_ADDITIONS.md`](../opurom-spec/TRANSPORT_AND_LANGUAGE_ADDITIONS.md)
+section 1.
 
 ## Architecture
 
 ```
-TCP/HTTP request -> HTTP/1.1 parser or HTTP/2 mapping
-                  request line + headers, or HEADERS/DATA + HPACK
+TCP/HTTP request -> HTTP/1.1 parser, HTTP/2 mapping or HTTP/3 mapping
+                  request line + headers, HEADERS/DATA + HPACK, or
+                  the h3 request/response exchange over QUIC
                   body cap 1 MiB -> 413
                -> middleware::MiddlewareChain
                   logging (plain by default) + body cap
@@ -55,6 +59,8 @@ accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
            ALPN: advertise h2/http/1.1, report the selected protocol
         -> h2: http2::serve (HEADERS/DATA, HPACK, streams, flow control, GOAWAY)
            -> same middleware/router/response features
+       -> h3: http3::serve (QUIC, TLS 1.3, ALPN "h3", a separate UDP listener)
+          -> same middleware/router/response features
        -> http/1.1 or no ALPN: optional WebSocket upgrade (RFC 6455, OPR_WEBSOCKET=1)
        -> HTTP/1.1 keep-alive loop (OPR_KEEPALIVE=1)
           Content-Length framing, idle timeout, in-flight limit
@@ -64,6 +70,7 @@ accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
 | --- | --- |
 | `http` | `Method`, `Request`, `Response`, the bounded request parser, status text |
 | `http2` | ALPN-selected HTTP/2: h2 HEADERS/DATA, HPACK, stream multiplexing, flow control, bounded settings, graceful GOAWAY and mapping into the shared request pipeline |
+| `http3` | HTTP/3 over QUIC on a separate UDP listener: the TLS 1.3 and ALPN `h3` endpoint, the real h3 request/response exchange and mapping into the shared request pipeline |
 | `middleware` | `MiddlewareChain`, `RateLimiter`, logging helpers, body cap, opt-in HTTP options |
 | `router` | route table, `:param` matching, panic isolation, 3-strike breaker |
 | `server` | `TcpListener` accept loop, one thread per connection, optional TLS, ALPN-selected HTTP/2, optional keep-alive, optional WebSocket upgrade, opt-in response features and measured JSON log |
@@ -289,6 +296,8 @@ close` on every response, byte-identical response bytes.
 | `OPR_TLS_KEY` | PEM private key file for the TLS listener |
 | `OPR_KEEPALIVE=1` | reuse one connection for several HTTP/1.1 requests |
 | `OPR_WEBSOCKET=1` | accept RFC 6455 WebSocket upgrades |
+| `OPR_HTTP3=1` | serve HTTP/3 over QUIC on a separate UDP listener |
+| `OPR_HTTP3_PORT` | the UDP port of the QUIC listener; the default is `4433` |
 
 ### TLS listener
 
@@ -396,9 +405,9 @@ Both values are settable in code with `Server::with_idle_timeout` and
 * **No permessage-deflate**: the WebSocket implementation negotiates no
   extensions and never compresses a frame. `Sec-WebSocket-Extensions` is
   neither sent nor honoured.
-* **No HTTP/3/QUIC**: ALPN advertisement and reporting are implemented, and
-  real HTTP/2 frames are served when ALPN selects `h2`. QUIC is not
-  implemented.
+* **The HTTP/3 listener is opt-in**: `OPR_HTTP3=1` starts a QUIC endpoint with
+  TLS 1.3 and ALPN `h3` on its own UDP port. Without the variable no UDP
+  socket is opened. See the HTTP/3 section below.
 * **No load-balancer integration**: no `X-Forwarded-*` handling, no
   `Forwarded` header parsing, no sticky-session or health-probe support for
   a proxy, and no proxy-protocol support.
@@ -488,7 +497,8 @@ completed h2 stream writes the same structured log fields with `"alpn":"h2"`.
 ### Mutual-TLS behaviour
 
 * The HTTP/2 implementation covers HPACK, HEADERS/DATA frames, streams and
-  flow control. There is no client-controlled priority tree and no HTTP/3/QUIC.
+  flow control. The HTTP/3 implementation covers QUIC transport, the HTTP/3
+  frame layer and QPACK header compression on a separate UDP listener.
 * The certificate status sources are the required static local DER CRL/OCSP
   checks; there is no OCSP stapling, CRL fetch, distributed revocation,
   certificate status protocol or revocation cache.
@@ -539,10 +549,82 @@ sends a 256 KiB response and a 128 KiB request across flow-control windows on
 the same connection while `GET /panic -> 500` leaves `GET /health -> 200`
 intact.
 
-There is no HTTP/3/QUIC, no server push, no client-controlled priority tree,
-no connection coalescing across origins, no h2 extended CONNECT or
+The HTTP/2 implementation has no server push, no client-controlled priority
+tree, no connection coalescing across origins, no h2 extended CONNECT or
 WebSocket-over-h2 upgrade, and no trailers. There is no application-level
 streaming: each response body is built in memory before h2 frames it.
+
+## Real HTTP/3 over QUIC (opt-in)
+
+`OPR_HTTP3=1` starts a QUIC endpoint on its own UDP port and serves real
+HTTP/3 on it. `OPR_HTTP3_PORT` chooses that port; the default is `4433`. The
+listener needs a certificate, so it reuses the configuration of the HTTPS
+listener: with `OPR_TLS=1` or `OPR_MTLS=1` the QUIC endpoint serves the same
+certificate and the same key pair. Without a TLS configuration there is no QUIC
+endpoint, and the server says so on stderr.
+
+The endpoint uses TLS 1.3 with the ALPN protocol `h3`. The `quinn` crate
+carries the QUIC transport and the `h3` crate the HTTP/3 frame layer with
+QPACK header compression. A QUIC connection only carries HTTP/3, so the ALPN
+list of the QUIC configuration contains `h3` alone.
+
+```sh
+OPR_TLS=1 OPR_HTTP3=1 OPR_HTTP3_PORT=4433 opurom-server
+```
+
+| Variable | Effect |
+| --- | --- |
+| `OPR_HTTP3` | starts the QUIC listener; without it no UDP socket is opened |
+| `OPR_HTTP3_PORT` | the UDP port of the QUIC listener; the default is `4433` |
+| `OPR_ALT_SVC_PORT` | the UDP port advertised with `Alt-Svc` on the HTTPS responses |
+
+### One shared request pipeline
+
+The HTTP/1.1, HTTP/2 and HTTP/3 paths have separate transports but one shared
+request pipeline. Each protocol converts its request into the same
+`http::Request` and calls the same `server::dispatch_request`, so the same
+middleware chain, rate limiter, CORS preflight, bearer auth, router, handler
+fault isolation, ETag/gzip/CORS finalization and structured log apply to all
+three. The same route therefore returns the same JSON body on every protocol;
+an integration test compares the HTTP/1.1 and HTTP/3 answers byte for byte.
+
+A panicking handler is caught by the same `catch_unwind` in the router on
+every protocol: HTTP/3 answers `500 {"error":"handler_panic"}` and the endpoint
+keeps serving the other routes.
+
+### Alt-Svc advertisement
+
+An HTTPS response advertises the HTTP/3 endpoint with an `Alt-Svc` header, so
+a client learns the QUIC alternative of the same origin:
+
+```
+Alt-Svc: h3=":4433"
+```
+
+The header is opt-in and appears only on a TLS listener, because the client has
+to reach the advertised endpoint over the same origin. Set
+`OPR_ALT_SVC_PORT` to choose the advertised port; without the variable the
+response headers stay unchanged. When the HTTP/3 listener is enabled its real
+UDP port is advertised, so a listener bound to an ephemeral port is
+advertised correctly. The HTTP/3 responses themselves carry no `Alt-Svc`
+header, because a client that already speaks HTTP/3 needs no alternative
+service.
+
+### Measured HTTP/3 exchange
+
+The integration test binds a QUIC endpoint on an ephemeral UDP port, completes
+a real TLS 1.3 handshake with ALPN `h3` and exchanges real h3 requests. The
+timings below are measured with `std::time::Instant` on the host that produced
+them; they are the handshake time of one QUIC connection and the round trip of
+one request.
+
+```
+[h3] GET /health -> 200 body={"ok":true} handshake=2.705875ms request=1.202666ms
+[h3] GET /items/42?q=one -> 200 body={"id":"42","query":"q=one"} handshake=1.830667ms request=736µs
+[h3] POST /echo -> 200 body=hello h3 handshake=1.763459ms request=452.583µs
+[h3] GET /panic -> 500 body={"error":"handler_panic"}
+[h3] GET /health after the panic -> 200 body={"ok":true}
+```
 
 ## Certificate status (opt-in)
 
@@ -746,6 +828,7 @@ Implemented and verified in this repository:
 | `opurom-serverc` lowering to a standalone crate | Implemented, tested |
 | TLS listener | Implemented, opt-in via `OPR_TLS=1`, rustls with a self-signed fallback, fingerprint logged, real handshake tested |
 | Real HTTP/2 | Implemented, ALPN-selected `h2` only, h2 0.4.20 frames/HPACK/multiplexing/flow control, shared router/middleware, bounded limits and graceful GOAWAY; no new environment variable |
+| Real HTTP/3 over QUIC | Implemented, opt-in via `OPR_HTTP3=1`, a separate UDP listener with TLS 1.3 and ALPN `h3`, real h3 request/response exchange, shared router/middleware/fault isolation, `Alt-Svc` advertisement on the HTTPS responses |
 | Mutual TLS client certificates | Implemented, opt-in via `OPR_MTLS=1` + `OPR_CLIENT_CA`, mandatory rustls verification over real sockets |
 | Certificate revocation | Implemented as a static `OPR_REVOKED` fingerprint deny list plus required static local DER CRL/OCSP serial status checks |
 | Static local certificate status | Implemented, opt-in via `OPR_CRL_FILE` / `OPR_OCSP_FILE`, CA-signature-verified, bounded DER parsing, fail-closed on unavailable/malformed/stale sources |
@@ -757,7 +840,7 @@ Out of scope for this repository:
 
 | Area | Note |
 | --- | --- |
-| HTTP/3 / QUIC | h2 runs over rustls/TCP only |
+| HTTP/3 server push and WebTransport | the HTTP/3 implementation covers the request/response exchange; no push promises and no WebTransport sessions |
 | HTTP/2 server push, priority tree and coalescing | no push promises, no client-controlled priority tree and no cross-origin connection reuse |
 | HTTP/2 extended CONNECT, WebSocket-over-h2, trailers | the RFC 6455 upgrade remains HTTP/1.1 only |
 | Live OCSP responder fetch / distributed revocation | the required status sources are static local DER files |

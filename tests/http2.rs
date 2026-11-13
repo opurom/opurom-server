@@ -102,7 +102,7 @@ fn start_server(envs: &[(&'static str, &str)], router: Router) -> TestServer {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let env_guard = EnvGuard::apply(envs);
     let mut chain = MiddlewareChain::new();
-    chain.push(Box::new(|request: &mut Request| {
+    chain.push(Arc::new(|request: &mut Request| {
         if request.path == "/blocked" {
             Some(Response::error(418, "blocked"))
         } else {

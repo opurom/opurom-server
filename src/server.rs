@@ -74,6 +74,8 @@ pub struct Server {
     idle_timeout: Duration,
     max_connections: usize,
     in_flight: Arc<AtomicUsize>,
+    /// The optional HTTP/3 listener on its own UDP port.
+    http3: Option<Arc<crate::http3::Http3Server>>,
 }
 
 impl Server {
@@ -134,12 +136,52 @@ impl Server {
         tls_config: Option<TlsConfig>,
     ) -> std::io::Result<Server> {
         let listener = TcpListener::bind(addr)?;
+        let router = Arc::new(router);
+        let middleware = Arc::new(middleware);
+        let limiter = RateLimiter::from_env().map(Arc::new);
+        let mut options = HttpOptions::from_env();
+        options.tls = tls_config.is_some();
+
+        // The HTTP/3 listener needs a TLS configuration, so it reuses the
+        // certificate of the HTTPS listener. Without one there is no QUIC
+        // endpoint and no advertised `Alt-Svc` header.
+        let http3 = match (crate::http3::enabled(), tls_config.as_ref()) {
+            (true, Some(tls)) => {
+                let http3_addr = format!("127.0.0.1:{}", crate::http3::port_from_env());
+                let endpoint = crate::http3::Http3Endpoint::bind(&http3_addr, tls)
+                    .map_err(std::io::Error::other)?;
+                // The real UDP port is advertised, so a port of 0 still works.
+                options.alt_svc_port = Some(endpoint.local_addr().port());
+                // A client that already speaks HTTP/3 needs no alternative
+                // service, so the HTTP/3 responses carry no `Alt-Svc` header.
+                let mut http3_options = options.clone();
+                http3_options.alt_svc_port = None;
+                let state = crate::http3::State {
+                    router: Arc::clone(&router),
+                    middleware: Arc::clone(&middleware),
+                    limiter: limiter.clone(),
+                    options: Arc::new(http3_options),
+                    max_body,
+                };
+                Some(Arc::new(crate::http3::Http3Server::new(endpoint, state)))
+            }
+            (true, None) => {
+                eprintln!(
+                    "[opurom-server] {} is set but there is no TLS configuration: \
+                     the HTTP/3 listener needs a certificate",
+                    crate::http3::HTTP3_ENV
+                );
+                None
+            }
+            _ => None,
+        };
+
         Ok(Server {
             listener,
-            router: Arc::new(router),
-            middleware: Arc::new(middleware),
-            limiter: RateLimiter::from_env().map(Arc::new),
-            options: Arc::new(HttpOptions::from_env()),
+            router,
+            middleware,
+            limiter,
+            options: Arc::new(options),
             max_body,
             shutdown: Arc::new(AtomicBool::new(false)),
             tls: tls_config.map(Arc::new),
@@ -148,6 +190,7 @@ impl Server {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             in_flight: Arc::new(AtomicUsize::new(0)),
+            http3,
         })
     }
 
@@ -200,8 +243,21 @@ impl Server {
         self.websocket
     }
 
+    /// The HTTP/3 listener of this server, when one is enabled.
+    pub fn http3(&self) -> Option<&Arc<crate::http3::Http3Server>> {
+        self.http3.as_ref()
+    }
+
     /// Serve until the shutdown handle is set. One thread per connection.
     pub fn serve(&self) {
+        if let Some(http3) = &self.http3 {
+            let http3 = Arc::clone(http3);
+            let shutdown = Arc::clone(&self.shutdown);
+            thread::spawn(move || {
+                http3.serve();
+                shutdown.store(true, Ordering::Relaxed);
+            });
+        }
         for stream in self.listener.incoming() {
             if self.shutdown.load(Ordering::Relaxed) {
                 break;

@@ -318,6 +318,19 @@ fn drain<R: BufRead>(reader: &mut R, count: usize) {
     }
 }
 
+/// True for headers that only belong to an HTTP/1.1 connection.
+///
+/// HTTP/2 and HTTP/3 both forbid these fields, so the transports drop them
+/// before they write a response.
+pub(crate) fn is_connection_specific(name: &str) -> bool {
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("te")
+}
+
 /// Collapse repeated slashes and drop a trailing slash (except at the root).
 pub(crate) fn normalize_path(path: &str) -> String {
     let mut out = String::from("/");

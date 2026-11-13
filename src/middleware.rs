@@ -29,6 +29,9 @@ pub const CORS_ENV: &str = "OPR_CORS";
 /// Environment variable that enables ETags by itself.
 pub const ETAG_ENV: &str = "OPR_ETAG";
 
+/// Environment variable holding the advertised HTTP/3 UDP port.
+pub const ALT_SVC_ENV: &str = "OPR_ALT_SVC_PORT";
+
 /// Length of one deterministic rate-limit window, in seconds.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
@@ -36,10 +39,13 @@ pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 pub const GZIP_THRESHOLD_BYTES: usize = 1024;
 
 /// One middleware layer.
-pub type Middleware = Box<dyn Fn(&mut Request) -> Option<Response> + Send + Sync>;
+///
+/// The layer is shared through an [`Arc`], so the same chain can serve the
+/// HTTP/1.1, HTTP/2 and HTTP/3 listeners.
+pub type Middleware = Arc<dyn Fn(&mut Request) -> Option<Response> + Send + Sync>;
 
 /// An ordered list of middleware layers.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct MiddlewareChain {
     layers: Vec<Middleware>,
 }
@@ -54,7 +60,6 @@ impl MiddlewareChain {
         self.layers.push(layer);
         self
     }
-
     /// Number of registered layers.
     pub fn len(&self) -> usize {
         self.layers.len()
@@ -128,7 +133,7 @@ pub fn tls_request_log_line(
 /// stderr. When structured logging is enabled the server writes one JSON line
 /// instead, so this layer stays silent to avoid a second log line.
 pub fn logging() -> Middleware {
-    Box::new(|request: &mut Request| {
+    Arc::new(|request: &mut Request| {
         if !structured_logging_enabled() {
             eprintln!(
                 "[opurom-server] -> {} {}",
@@ -142,7 +147,7 @@ pub fn logging() -> Middleware {
 
 /// Body-size cap layer: rejects a parsed body larger than `limit` with 413.
 pub fn body_cap(limit: usize) -> Middleware {
-    Box::new(move |request: &mut Request| {
+    Arc::new(move |request: &mut Request| {
         if request.body.len() > limit {
             return Some(Response::error(413, "payload_too_large"));
         }
@@ -221,7 +226,7 @@ pub fn rate_limited_response(retry_after: u64) -> Response {
 }
 
 fn rate_limit_with(limiter: Arc<RateLimiter>) -> Middleware {
-    Box::new(move |request: &mut Request| limiter.check(request).map(rate_limited_response))
+    Arc::new(move |request: &mut Request| limiter.check(request).map(rate_limited_response))
 }
 
 /// Build a middleware layer allowing at most `limit` requests per route per
@@ -242,6 +247,16 @@ pub struct HttpOptions {
     pub auth_token: Option<String>,
     pub cors_origin: Option<String>,
     pub etag: bool,
+    /// The UDP port of the HTTP/3 endpoint, advertised with `Alt-Svc`.
+    ///
+    /// The value is `None` unless an operator sets [`ALT_SVC_ENV`], so the
+    /// default response headers stay unchanged.
+    pub alt_svc_port: Option<u16>,
+    /// True when the listener terminates TLS.
+    ///
+    /// An alternative service is advertised only on a TLS listener, because
+    /// the client must reach the advertised endpoint over the same origin.
+    pub tls: bool,
 }
 
 impl HttpOptions {
@@ -262,8 +277,22 @@ impl HttpOptions {
             auth_token,
             cors_origin,
             etag,
+            alt_svc_port: alt_svc_port_from_env(),
+            tls: crate::tls::tls_enabled(),
         }
     }
+}
+
+/// Read the advertised HTTP/3 UDP port from [`ALT_SVC_ENV`].
+///
+/// An invalid or out-of-range value disables the advertisement instead of
+/// changing the default response headers.
+pub fn alt_svc_port_from_env() -> Option<u16> {
+    std::env::var(ALT_SVC_ENV)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| raw.parse().ok())
 }
 
 /// Compare bytes without an early exit on the first differing byte.
@@ -410,8 +439,23 @@ pub fn gzip_body(body: &[u8]) -> std::io::Result<Vec<u8>> {
     encoder.finish()
 }
 
+/// The `Alt-Svc` header value that advertises the HTTP/3 endpoint.
+pub fn alt_svc_header_value(port: u16) -> String {
+    format!("h3=\":{}\"", port)
+}
+
 /// Apply the opt-in HTTP response features to a completed response.
 pub fn apply_response_features(response: &mut Response, request: &Request, options: &HttpOptions) {
+    // An alternative service is advertised only on a TLS listener, because
+    // the client must reach the advertised endpoint over the same origin.
+    if options.tls {
+        if let Some(port) = options.alt_svc_port {
+            if !has_header(response, "Alt-Svc") {
+                response.set_header("Alt-Svc", &alt_svc_header_value(port));
+            }
+        }
+    }
+
     if let Some(origin) = options.cors_origin.as_deref() {
         if !has_header(response, "Access-Control-Allow-Origin") {
             response.set_header("Access-Control-Allow-Origin", origin);

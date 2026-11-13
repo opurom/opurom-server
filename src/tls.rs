@@ -36,6 +36,8 @@ use rustls::{
 };
 use sha2::{Digest, Sha256};
 
+use quinn::crypto::rustls::QuicServerConfig;
+
 use crate::cert_status::{self, StatusChecker, StatusSource};
 
 /// Environment variable that enables the TLS listener.
@@ -139,17 +141,32 @@ impl MtlsOptions {
 }
 
 /// The TLS configuration of one server.
-#[derive(Clone)]
 pub struct TlsConfig {
     config: Arc<ServerConfig>,
     /// The SHA-256 fingerprint of the leaf certificate, uppercase hex.
     fingerprint: String,
     /// The DER bytes of the leaf certificate.
     certificate_der: Vec<u8>,
+    /// The private key of the leaf certificate, kept so the QUIC listener can
+    /// rebuild a TLS 1.3 configuration from the same key pair.
+    private_key: PrivateKeyDer<'static>,
     /// True when the certificate was generated at startup.
     self_signed: bool,
     /// True when the handshake requires a verified client certificate.
     mtls: bool,
+}
+
+impl Clone for TlsConfig {
+    fn clone(&self) -> TlsConfig {
+        TlsConfig {
+            config: Arc::clone(&self.config),
+            fingerprint: self.fingerprint.clone(),
+            certificate_der: self.certificate_der.clone(),
+            private_key: self.private_key.clone_key(),
+            self_signed: self.self_signed,
+            mtls: self.mtls,
+        }
+    }
 }
 
 impl fmt::Debug for TlsConfig {
@@ -161,7 +178,6 @@ impl fmt::Debug for TlsConfig {
             .finish()
     }
 }
-
 impl TlsConfig {
     /// The shared rustls server configuration.
     pub fn server_config(&self) -> Arc<ServerConfig> {
@@ -192,6 +208,37 @@ impl TlsConfig {
     /// Start one server-side TLS connection.
     pub fn connect(&self) -> Result<ServerConnection, rustls::Error> {
         ServerConnection::new(self.server_config())
+    }
+
+    /// Build the QUIC server crypto configuration from this configuration.
+    ///
+    /// QUIC requires TLS 1.3, so the shared server configuration is rebuilt
+    /// with the TLS 1.3 protocol version and the certificate of this server.
+    /// The ALPN list is replaced with `h3`, because a QUIC connection only
+    /// carries HTTP/3.
+    pub fn quic_server_config(&self, alpn: &[u8]) -> Result<QuicServerConfig, TlsError> {
+        let mut config =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![CertificateDer::from(self.certificate_der.clone())],
+                    self.private_key.clone_key(),
+                )
+                .map_err(|err| {
+                    TlsError::new(format!(
+                "the TLS certificate and private key do not form a usable pair for QUIC: {}",
+                err
+            ))
+                })?;
+        config.alpn_protocols = vec![alpn.to_vec()];
+        // QUIC accepts either 0 or u32::MAX as the early-data limit.
+        config.max_early_data_size = u32::MAX;
+        QuicServerConfig::try_from(config).map_err(|err| {
+            TlsError::new(format!(
+                "the TLS configuration is not usable for QUIC: {}",
+                err
+            ))
+        })
     }
 }
 
@@ -384,11 +431,12 @@ fn make_tls_config(
 ) -> Result<TlsConfig, TlsError> {
     let fingerprint = fingerprint_of(certs[0].as_ref());
     let certificate_der = certs[0].as_ref().to_vec();
-    let config = build_server_config(certs, key, pair, mtls)?;
+    let config = build_server_config(certs, key.clone_key(), pair, mtls)?;
     Ok(TlsConfig {
         config: Arc::new(config),
         fingerprint,
         certificate_der,
+        private_key: key,
         self_signed,
         mtls: mtls.is_some(),
     })

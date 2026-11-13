@@ -898,7 +898,9 @@ fn readme(ir: &Ir) -> String {
     out.push_str("* `OPR_MTLS=1` - requires a client certificate signed by `OPR_CLIENT_CA` (a client CA PEM path or inline PEM); also enables TLS\n");
     out.push_str("* `OPR_REVOKED` - static comma-separated SHA-256 certificate fingerprint deny list, active only with `OPR_MTLS=1`\n");
     out.push_str("* `OPR_CRL_FILE` - required static local DER X.509 v2 CRL, active only with `OPR_MTLS=1`; a missing, malformed, stale or unverifiable CRL refuses the handshake\n");
-    out.push_str("* `OPR_OCSP_FILE` - required static local DER BasicOCSPResponse, active only with `OPR_MTLS=1`; good/revoked/unknown statuses, CA signature and freshness are checked\n\n");
+    out.push_str("* `OPR_OCSP_FILE` - required static local DER BasicOCSPResponse, active only with `OPR_MTLS=1`; good/revoked/unknown statuses, CA signature and freshness are checked\n");
+    out.push_str("* `OPR_HTTP3=1` - serves HTTP/3 over QUIC on a separate UDP listener with TLS 1.3 and ALPN `h3`; `OPR_HTTP3_PORT` chooses the UDP port (default `4433`)\n");
+    out.push_str("* `OPR_ALT_SVC_PORT` - the UDP port advertised with `Alt-Svc: h3=\":PORT\"` on the HTTPS responses\n\n");
     out.push_str("The service opens one `PooledDb` at startup and shares its Mutex-serialized SQLite connection across all handlers. With no optional hardening env vars and no gzip request header, HTTP responses and stdout stay byte-identical. The rate-limit and log variables never enable the opt-in HTTP response features.\n\n");
     out.push_str("The schema is created at startup from the embedded `migrations/*.sql`.\n\n");
     out.push_str("## Routes\n\n");
