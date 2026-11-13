@@ -1,7 +1,7 @@
 //! HTTP/1.1 primitives: method, request, response and a bounded std-only parser.
 
 use std::collections::BTreeMap;
-use std::io::BufRead;
+use std::io::{BufRead, ErrorKind, Read};
 
 use serde_json::Value;
 
@@ -177,6 +177,7 @@ pub fn status_text(status: u16) -> &'static str {
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
@@ -206,13 +207,19 @@ impl HttpError {
 
 /// Read one HTTP/1.1 request: request line, headers, then a Content-Length
 /// body. Bodies larger than `max_body` are rejected with 413 before buffering.
+/// The request line and headers share one `MAX_HEADER_BYTES` budget enforced
+/// while reading, so an endless line cannot be buffered without a bound.
 pub fn read_request<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Request, HttpError> {
+    let mut head = Read::take(&mut *reader, (MAX_HEADER_BYTES + 1) as u64);
     let mut request_line = String::new();
-    let read = reader
+    let read = head
         .read_line(&mut request_line)
-        .map_err(|_| HttpError::new(400, "bad_request: cannot read request line"))?;
+        .map_err(|err| read_error(err, "bad_request: cannot read request line"))?;
     if read == 0 {
         return Err(HttpError::new(400, "bad_request: empty request"));
+    }
+    if head.limit() == 0 {
+        return Err(HttpError::new(431, "header_block_too_large"));
     }
 
     let mut parts = request_line
@@ -235,18 +242,16 @@ pub fn read_request<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Reque
     }
 
     let mut headers = Vec::new();
-    let mut header_bytes = 0usize;
     loop {
         let mut line = String::new();
-        let read = reader
+        let read = head
             .read_line(&mut line)
-            .map_err(|_| HttpError::new(400, "bad_request: cannot read header"))?;
-        if read == 0 {
-            return Err(HttpError::new(400, "bad_request: truncated headers"));
-        }
-        header_bytes += read;
-        if header_bytes > MAX_HEADER_BYTES {
+            .map_err(|err| read_error(err, "bad_request: cannot read header"))?;
+        if head.limit() == 0 {
             return Err(HttpError::new(431, "header_block_too_large"));
+        }
+        if read == 0 || !line.ends_with('\n') {
+            return Err(HttpError::new(400, "bad_request: truncated headers"));
         }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
@@ -257,6 +262,7 @@ pub fn read_request<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Reque
             .ok_or_else(|| HttpError::new(400, "bad_request: malformed header"))?;
         headers.push((name.trim().to_string(), value.trim().to_string()));
     }
+    drop(head);
 
     let mut length = 0usize;
     for (name, value) in &headers {
@@ -280,7 +286,7 @@ pub fn read_request<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Reque
     if length > 0 {
         reader
             .read_exact(&mut body)
-            .map_err(|_| HttpError::new(400, "bad_request: truncated body"))?;
+            .map_err(|err| read_error(err, "bad_request: truncated body"))?;
     }
 
     let (raw_path, query) = match target.split_once('?') {
@@ -303,6 +309,15 @@ pub fn read_request<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Reque
         params: BTreeMap::new(),
         version: version.to_string(),
     })
+}
+
+/// A socket read timeout is a 408; other read failures are malformed requests.
+fn read_error(err: std::io::Error, context: &str) -> HttpError {
+    if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
+        HttpError::new(408, "request_timeout")
+    } else {
+        HttpError::new(400, context)
+    }
 }
 
 /// Read and discard `count` bytes, ignoring errors.

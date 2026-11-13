@@ -91,6 +91,9 @@ handler is caught, and no failure path aborts the process.
   is rejected with 501.
 * Body cap: 1 MiB (`http::MAX_BODY_BYTES`). A larger body gets `413` and the body is
   drained so the client can read the answer.
+* Header cap: 64 KiB (`http::MAX_HEADER_BYTES`) covers the request line and all
+  header lines, enforced while the bytes arrive. A larger block gets `431`,
+  including one line that never terminates. A read that times out gets `408`.
 * Response: always `Content-Type: application/json` for JSON bodies, `text/html` for
   SSR, `Content-Length`, and `Connection: close` by default. `304`
   and `204` carry no body and `Content-Length: 0`. With `OPR_KEEPALIVE=1` the
@@ -129,6 +132,8 @@ handler is caught, and no failure path aborts the process.
 | Unknown path | 404 | `{"error":"not_found"}` |
 | Wrong method | 405 | `{"error":"method_not_allowed"}` |
 | Body over 1 MiB | 413 | `{"error":"payload_too_large"}` |
+| Header block over 64 KiB | 431 | `{"error":"header_block_too_large"}` |
+| Incomplete request read times out | 408 | `{"error":"request_timeout"}` |
 | Rate limit exceeded | 429 | `{"error":"rate_limited"}` plus `Retry-After` seconds |
 | Missing/mismatched bearer token (`OPR_AUTH_TOKEN`) | 401 | `{"error":"unauthorized"}` |
 | Matching `If-None-Match` (ETag enabled) | 304 | empty |
@@ -384,7 +389,8 @@ Two bounds keep a long-lived connection from holding resources forever:
 
 * **Idle timeout**: a connection that waits longer than
   `server::DEFAULT_IDLE_TIMEOUT` (30 seconds) for its next request is
-  closed. The timeout is also the socket read timeout.
+  closed. The timeout is also the socket read timeout, so an incomplete
+  request gets `408` before the connection closes.
 * **Maximum in-flight connections**: at most
   `server::DEFAULT_MAX_CONNECTIONS` (256) connections are served at the
   same time. A connection that arrives above the limit gets
@@ -829,6 +835,7 @@ port over TCP:
 | Test file | Covers |
 | --- | --- |
 | `tests/http_server.rs` | health, the full CRUD lifecycle, 404, 405, 413, the 1 MiB boundary, panic -> 500 -> 503 with other routes still serving, `:param` matching |
+| `tests/request_bounds.rs` | loopback TCP checks for the 1 MiB body cap (413), the 64 KiB header block cap (431), an unterminated oversized header line stopped by the same cap, a stalled request timing out with 408 while another connection still gets 200, pipelined requests answered in order and the documented limit constants |
 | `tests/ssr.rs` | byte-identical output for the same IR and theme, theme changes the output, state interpolation, kind -> HTML element mapping, IR version validation |
 | `tests/codegen.rs` | generated crate shape, migration SQL, deterministic lowering, IR validation, one shared `PooledDb` in generated code |
 | `tests/hardening.rs` | deterministic N/N+1 rate-limit boundary and window reset, `OPR_RATE_LIMIT` over TCP, JSON log shape with numeric measured `elapsed_ms`, one JSON stderr line per request, byte-identical default responses |
