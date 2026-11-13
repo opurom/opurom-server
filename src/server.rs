@@ -33,7 +33,7 @@ use rustls::StreamOwned;
 use tokio::net::TcpStream as TokioTcpStream;
 use tokio_rustls::TlsAcceptor;
 
-use crate::http::{read_request, status_text, Request, Response, MAX_BODY_BYTES};
+use crate::http::{read_request, status_text, Method, Request, Response, MAX_BODY_BYTES};
 use crate::http2::{self, State as H2State};
 use crate::middleware::{
     apply_response_features, authorized, cors_preflight, rate_limited_response, request_log_line,
@@ -519,7 +519,7 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
         }
 
         let started = Instant::now();
-        let (response, method, path, reuse) = match read_request(&mut reader, max_body) {
+        let (response, method, path, reuse, head_only) = match read_request(&mut reader, max_body) {
             Ok(mut request) => {
                 // A WebSocket upgrade takes over the connection.
                 if websocket {
@@ -529,6 +529,7 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
                 }
                 let method = request.method.as_str().to_string();
                 let path = request.path.clone();
+                let head_only = request.method == Method::Head;
                 let response = dispatch_request(
                     &mut request,
                     router.as_ref(),
@@ -537,16 +538,17 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
                     options.as_ref(),
                 );
                 let reuse = keep_alive && wants_keep_alive(&request);
-                (response, method, path, reuse)
+                (response, method, path, reuse, head_only)
             }
             Err(err) => (
                 Response::error(err.status, &err.message),
                 "-".to_string(),
                 "-".to_string(),
                 false,
+                false,
             ),
         };
-        let result = write_response_with(reader.get_mut(), &response, reuse);
+        let result = write_response_head_aware(reader.get_mut(), &response, reuse, head_only);
         if structured_logging_enabled() {
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let line = match alpn.as_deref() {
@@ -624,11 +626,24 @@ pub fn write_response<W: Write>(writer: &mut W, response: &Response) -> std::io:
 }
 
 /// Write the response. With `keep_alive` the answer carries
-/// `Connection: keep-alive`, otherwise `Connection: close`.
+/// `Connection: keep-alive`, otherwise `Connection: close`. With `head_only`
+/// the `Content-Length` of the full body is kept but the body is not written,
+/// which is the HTTP/1.1 HEAD form.
 pub fn write_response_with<W: Write>(
     writer: &mut W,
     response: &Response,
     keep_alive: bool,
+) -> std::io::Result<()> {
+    write_response_head_aware(writer, response, keep_alive, false)
+}
+
+/// Write one response, suppressing the body when `head_only` is set while
+/// keeping the `Content-Length` that describes the full GET body.
+pub(crate) fn write_response_head_aware<W: Write>(
+    writer: &mut W,
+    response: &Response,
+    keep_alive: bool,
+    head_only: bool,
 ) -> std::io::Result<()> {
     let mut head = format!(
         "HTTP/1.1 {} {}\r\n",
@@ -648,7 +663,9 @@ pub fn write_response_with<W: Write>(
         "Connection: close\r\n\r\n"
     });
     writer.write_all(head.as_bytes())?;
-    writer.write_all(&response.body)?;
+    if !head_only {
+        writer.write_all(&response.body)?;
+    }
     writer.flush()
 }
 

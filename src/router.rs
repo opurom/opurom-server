@@ -190,7 +190,9 @@ impl Router {
                 None => continue,
             };
             path_matched = true;
-            if route.method != request.method {
+            // HEAD reads the same resource a GET serves, so it resolves against
+            // the GET route and keeps that response's headers.
+            if !method_serves(&route.method, &request.method) {
                 continue;
             }
             request.params = params;
@@ -218,4 +220,10 @@ impl Router {
             Response::error(404, "not_found")
         }
     }
+}
+
+/// True when a registered route method answers the request method. A `HEAD`
+/// request is served by the matching `GET` route.
+fn method_serves(route: &Method, request: &Method) -> bool {
+    route == request || (*request == Method::Head && *route == Method::Get)
 }

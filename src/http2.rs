@@ -162,6 +162,7 @@ async fn serve_stream(
     let mut app_request = app_request(&parts);
     let method = app_request.method.as_str().to_string();
     let path = app_request.path.clone();
+    let head_only = app_request.method == Method::Head;
     let response =
         match read_request(&mut request_body, &mut respond, &state, &mut app_request).await {
             Some(response) => response,
@@ -170,7 +171,7 @@ async fn serve_stream(
             None => return,
         };
 
-    if let Err(err) = send_response(&mut respond, &response).await {
+    if let Err(err) = send_response(&mut respond, &response, head_only).await {
         eprintln!("[opurom-server] HTTP/2 stream failed: {}", err);
         return;
     }
@@ -267,9 +268,12 @@ async fn read_body(body: &mut RecvStream, max_body: usize) -> Result<Vec<u8>, Ap
 async fn send_response(
     respond: &mut SendResponse<Bytes>,
     response: &AppResponse,
+    head_only: bool,
 ) -> Result<(), String> {
     let head = h2_response(response)?;
-    let end_of_stream = response.body.is_empty();
+    // A HEAD answer keeps the GET headers and Content-Length but ends the
+    // stream at the headers, sending no DATA frame.
+    let end_of_stream = head_only || response.body.is_empty();
     let mut send = respond
         .send_response(head, end_of_stream)
         .map_err(|err| err.to_string())?;
