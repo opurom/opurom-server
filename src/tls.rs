@@ -8,12 +8,15 @@
 //!
 //! `OPR_MTLS=1` with `OPR_CLIENT_CA` makes the listener require and verify a
 //! client certificate during the rustls handshake. `OPR_REVOKED` is a static,
-//! comma-separated SHA-256 fingerprint deny list, NOT OCSP or a distributed
-//! CRL. Both TLS modes advertise `h2` and `http/1.1` through ALPN; R9 serves
-//! real HTTP/2 frames when `h2` is selected.
+//! comma-separated SHA-256 fingerprint deny list. `OPR_CRL_FILE` and
+//! `OPR_OCSP_FILE` add required static local DER status sources; both are
+//! checked on every mTLS handshake and fail closed when unusable. Both TLS
+//! modes advertise `h2` and `http/1.1` through ALPN; R9 serves real HTTP/2
+//! frames when `h2` is selected.
 //!
-//! Honest scope: no OCSP/CRL fetch, no HSM, no certificate transparency and
-//! no cipher-suite tuning beyond the library defaults.
+//! Honest scope: no live OCSP responder fetch or CRL distribution point, no
+//! certificate transparency, no distributed revocation, no HSM and no
+//! cipher-suite tuning beyond the library defaults.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -32,6 +35,8 @@ use rustls::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::cert_status::{self, StatusChecker, StatusSource};
+
 /// Environment variable that enables the TLS listener.
 pub const TLS_ENV: &str = "OPR_TLS";
 
@@ -49,6 +54,12 @@ pub const CLIENT_CA_ENV: &str = "OPR_CLIENT_CA";
 
 /// Environment variable holding a comma-separated fingerprint deny list.
 pub const REVOKED_ENV: &str = "OPR_REVOKED";
+
+/// Environment variable holding a required local DER CRL file path.
+pub const CRL_FILE_ENV: &str = "OPR_CRL_FILE";
+
+/// Environment variable holding a required local DER BasicOCSPResponse path.
+pub const OCSP_FILE_ENV: &str = "OPR_OCSP_FILE";
 
 /// The protocols advertised through ALPN, in server preference order.
 pub const ALPN_PROTOCOLS: &[&str] = &["h2", "http/1.1"];
@@ -78,14 +89,19 @@ impl fmt::Display for TlsError {
 
 impl std::error::Error for TlsError {}
 
-/// One opt-in mTLS configuration: trusted client CA certificates and the
-/// SHA-256 fingerprints of certificates that must be denied.
+/// One opt-in mTLS configuration: trusted client CA certificates, the
+/// SHA-256 fingerprints of certificates that must be denied and optional
+/// required static local certificate status sources.
 #[derive(Clone, Debug, Default)]
 pub struct MtlsOptions {
     /// PEM bytes of one or more trusted client CA certificates.
     pub client_ca_pem: Vec<u8>,
     /// SHA-256 fingerprints, with or without colons, in any hex case.
     pub revoked: Vec<String>,
+    /// A required DER CRL source, when `OPR_CRL_FILE` or a test supplies one.
+    pub crl: Option<StatusSource>,
+    /// A required DER BasicOCSPResponse source, when `OPR_OCSP_FILE` or a test supplies one.
+    pub ocsp: Option<StatusSource>,
 }
 
 impl MtlsOptions {
@@ -115,6 +131,8 @@ impl MtlsOptions {
         Ok(Some(MtlsOptions {
             client_ca_pem,
             revoked,
+            crl: cert_status::status_source_from_env(CRL_FILE_ENV),
+            ocsp: cert_status::status_source_from_env(OCSP_FILE_ENV),
         }))
     }
 }
@@ -412,13 +430,15 @@ fn client_cert_verifier(options: &MtlsOptions) -> Result<Arc<dyn ClientCertVerif
             CLIENT_CA_ENV
         )));
     }
-    for ca in cas {
-        roots.add(ca).map_err(|err| {
-            TlsError::new(format!(
-                "{} has an unusable CA certificate: {}",
-                CLIENT_CA_ENV, err
-            ))
-        })?;
+    for ca in &cas {
+        roots
+            .add(CertificateDer::from(ca.as_ref().to_vec()))
+            .map_err(|err| {
+                TlsError::new(format!(
+                    "{} has an unusable CA certificate: {}",
+                    CLIENT_CA_ENV, err
+                ))
+            })?;
     }
     let inner = WebPkiClientVerifier::builder(Arc::new(roots))
         .build()
@@ -431,10 +451,26 @@ fn client_cert_verifier(options: &MtlsOptions) -> Result<Arc<dyn ClientCertVerif
     let revoked: BTreeSet<String> = parse_revoked(&options.revoked.join(","))?
         .into_iter()
         .collect();
-    if revoked.is_empty() {
+    let status = if options.crl.is_some() || options.ocsp.is_some() {
+        Some(
+            StatusChecker::new(&cas, options.crl.clone(), options.ocsp.clone()).map_err(|err| {
+                TlsError::new(format!(
+                    "cannot use the certificate status sources: {}",
+                    err
+                ))
+            })?,
+        )
+    } else {
+        None
+    };
+    if revoked.is_empty() && status.is_none() {
         Ok(inner)
     } else {
-        Ok(Arc::new(RevokingClientCertVerifier { inner, revoked }))
+        Ok(Arc::new(RevokingClientCertVerifier {
+            inner,
+            revoked,
+            status,
+        }))
     }
 }
 
@@ -457,11 +493,12 @@ fn parse_revoked(raw: &str) -> Result<Vec<String>, TlsError> {
 }
 
 /// A client-certificate verifier that delegates chain and signature checks to
-/// rustls and then applies the static fingerprint deny list.
+/// rustls and then applies the static deny list and required status sources.
 #[derive(Debug)]
 struct RevokingClientCertVerifier {
     inner: Arc<dyn ClientCertVerifier>,
     revoked: BTreeSet<String>,
+    status: Option<StatusChecker>,
 }
 
 impl ClientCertVerifier for RevokingClientCertVerifier {
@@ -494,6 +531,13 @@ impl ClientCertVerifier for RevokingClientCertVerifier {
             .any(|cert| self.revoked.contains(&denylist_fingerprint(cert.as_ref())))
         {
             return Err(RustlsError::InvalidCertificate(CertificateError::Revoked));
+        }
+        if let Some(status) = &self.status {
+            status
+                .check(end_entity.as_ref(), now.as_secs())
+                .map_err(|err| {
+                    RustlsError::General(format!("certificate status refused: {}", err))
+                })?;
         }
         Ok(verified)
     }

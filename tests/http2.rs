@@ -43,6 +43,8 @@ const OPR_VARS: &[&str] = &[
     "OPR_MTLS",
     "OPR_CLIENT_CA",
     "OPR_REVOKED",
+    "OPR_CRL_FILE",
+    "OPR_OCSP_FILE",
 ];
 
 static BIND_LOCK: Mutex<()> = Mutex::new(());

@@ -53,6 +53,8 @@ impl DemoServer {
             .env_remove("OPR_MTLS")
             .env_remove("OPR_CLIENT_CA")
             .env_remove("OPR_REVOKED")
+            .env_remove("OPR_CRL_FILE")
+            .env_remove("OPR_OCSP_FILE")
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file));
         for (key, value) in envs {

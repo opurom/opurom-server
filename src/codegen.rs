@@ -851,7 +851,9 @@ fn readme(ir: &Ir) -> String {
     out.push_str("* `OPR_KEEPALIVE=1` - reuses one connection for several HTTP/1.1 requests; `Connection: close` still ends the connection\n");
     out.push_str("* `OPR_WEBSOCKET=1` - accepts RFC 6455 WebSocket upgrades\n");
     out.push_str("* `OPR_MTLS=1` - requires a client certificate signed by `OPR_CLIENT_CA` (a client CA PEM path or inline PEM); also enables TLS\n");
-    out.push_str("* `OPR_REVOKED` - static comma-separated SHA-256 certificate fingerprint deny list, active only with `OPR_MTLS=1`; NOT OCSP or a distributed CRL\n\n");
+    out.push_str("* `OPR_REVOKED` - static comma-separated SHA-256 certificate fingerprint deny list, active only with `OPR_MTLS=1`; NOT OCSP or a distributed CRL\n");
+    out.push_str("* `OPR_CRL_FILE` - required static local DER X.509 v2 CRL, active only with `OPR_MTLS=1`; a missing, malformed, stale or unverifiable CRL refuses the handshake\n");
+    out.push_str("* `OPR_OCSP_FILE` - required static local DER BasicOCSPResponse, active only with `OPR_MTLS=1`; good/revoked/unknown statuses, CA signature and freshness are checked; no live responder fetch\n\n");
     out.push_str("The service opens one `PooledDb` at startup and shares its Mutex-serialized SQLite connection across all handlers. With no optional hardening env vars and no gzip request header, HTTP responses and stdout stay byte-identical. R4 env vars do not enable R5 features.\n\n");
     out.push_str("The schema is created at startup from the embedded `migrations/*.sql`.\n\n");
     out.push_str("## Routes\n\n");

@@ -1,21 +1,23 @@
 # opurom-server
 
-OPUROM R2/R4/R5/R7/R8/R9 backend runtime: a small HTTP/1.1 server with
+OPUROM R2/R4/R5/R7/R8/R9/R10 backend runtime: a small HTTP/1.1 server with
 ALPN-selected HTTP/2, a router with path parameters, per-route fault
 isolation, a deterministic SSR host, R4 hardening (pooled SQLite,
 fixed-window rate limiting, structured logs), opt-in R5 HTTP features
 (bearer auth, gzip, ETag, CORS), opt-in R7 transport features (TLS,
 WebSocket, HTTP/1.1 keep-alive), opt-in R8 TLS features (mutual TLS, a static
-certificate revocation deny list and ALPN reporting), and `opurom-serverc`,
-the compiler that lowers a full-stack IR into a standalone Rust service crate.
+certificate revocation deny list and ALPN reporting), opt-in R10 static local
+DER CRL/OCSP certificate status checks, and `opurom-serverc`, the compiler
+that lowers a full-stack IR into a standalone Rust service crate.
 
 This crate implements the backend half of
 [`FULLSTACK_SPEC.md`](../opurom-spec/FULLSTACK_SPEC.md) sections 4-5,
 [`R4_ADDENDUM.md`](../opurom-spec/R4_ADDENDUM.md) section 6,
 [`R5_ADDENDUM.md`](../opurom-spec/R5_ADDENDUM.md) section 6,
 [`R7_ADDENDUM.md`](../opurom-spec/R7_ADDENDUM.md) sections 1 and 5,
-[`R8_ADDENDUM.md`](../opurom-spec/R8_ADDENDUM.md) section 4 and
-[`R9_ADDENDUM.md`](../opurom-spec/R9_ADDENDUM.md) section 2.
+[`R8_ADDENDUM.md`](../opurom-spec/R8_ADDENDUM.md) section 4,
+[`R9_ADDENDUM.md`](../opurom-spec/R9_ADDENDUM.md) section 2 and
+[`R10_ADDENDUM.md`](../opurom-spec/R10_ADDENDUM.md) section 5.
 
 ## Architecture
 
@@ -47,6 +49,7 @@ The R7/R8/R9 transport layer wraps that core:
 ```
 accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
            OPR_MTLS=1: require a client certificate, apply the static deny list
+            and every required local DER CRL/OCSP status source
            ALPN: advertise h2/http/1.1, report the selected protocol
         -> h2: http2::serve (HEADERS/DATA, HPACK, streams, flow control, GOAWAY)
            -> same middleware/router/response features
@@ -62,7 +65,8 @@ accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
 | `middleware` | `MiddlewareChain`, `RateLimiter`, logging helpers, body cap, opt-in R5 HTTP options |
 | `router` | route table, `:param` matching, panic isolation, 3-strike breaker |
 | `server` | `TcpListener` accept loop, one thread per connection, optional TLS, ALPN-selected HTTP/2, optional keep-alive, optional WebSocket upgrade, R5 response features and measured JSON log |
-| `tls` | the optional TLS listener: environment configuration, PEM loading, self-signed fallback, SHA-256 fingerprint, opt-in client-certificate mTLS, static fingerprint deny list and ALPN |
+| `tls` | the optional TLS listener: environment configuration, PEM loading, self-signed fallback, SHA-256 fingerprint, opt-in client-certificate mTLS, static fingerprint deny list, required local DER CRL/OCSP status sources and ALPN |
+| `cert_status` | bounded DER CRL/BasicOCSPResponse parsing, CA signature checks, serial matching, freshness checks and fail-closed status decisions |
 | `websocket` | the RFC 6455 frame codec with size limits, the server channel and the client helper |
 | `ssr` | deterministic HTML rendering of the IR tree with theme tokens |
 | `ir` | IR v0.1 model: state, tree, theme, models, api |
@@ -98,6 +102,10 @@ handler is caught, and no failure path aborts the process.
   frames, preserve status, body and opt-in R5 headers, set an exact
   `Content-Length` and omit HTTP/1.1 `Connection` headers. Plain HTTP, no
   ALPN and `http/1.1` ALPN keep the R8 HTTP/1.1 wire bytes.
+* R10 status sources are opt-in too. With neither `OPR_CRL_FILE` nor
+  `OPR_OCSP_FILE` set, the R9 mTLS handshake and HTTP/1.1 response bytes stay
+  identical. With either set, that local DER source is required for every mTLS
+  handshake and any unavailable or unusable source refuses the connection.
 
 | Situation | Status | Body |
 | --- | --- | --- |
@@ -258,7 +266,7 @@ An unauthorized request still counts against `OPR_RATE_LIMIT` and gets an
 headers compose on one response, and `304` keeps CORS headers but has no
 compressed body. The generated service's one shared `PooledDb` is unchanged.
 
-Still R10+: a real authentication/identity provider, token lifecycle,
+Still R11+: a real authentication/identity provider, token lifecycle,
 per-route CORS and credentialed CORS, application-level response streaming,
 compression dictionaries, Brotli/zstd, chunked HTTP/1.1 bodies, a sized
 connection pool and a distributed rate limit. R9 h2 applies the same
@@ -376,8 +384,9 @@ Both values are settable in code with `Server::with_idle_timeout` and
 
 * **Client certificates are an R8 opt-in**: the R7 variables alone never ask
   for a client certificate. See the R8 section below.
-* **No OCSP or distributed CRL**: R8 adds a static fingerprint deny list, not
-  OCSP, stapling, a CRL distribution point or any revocation fetch.
+* **No live status fetch**: R10 adds required static local DER CRL/OCSP
+  status sources, not OCSP stapling, a CRL distribution point, a live
+  responder or distributed revocation. See the R10 section below.
 * **No HSM and no cipher-suite tuning**: the cipher suites and the protocol
   versions are the `rustls` library defaults. There is no configuration for
   them.
@@ -396,7 +405,7 @@ Both values are settable in code with `Server::with_idle_timeout` and
 * **The keep-alive loop is per connection**: one thread per connection is
   still the model, so the idle timeout bounds each thread rather than a
   shared pool.
-* **Still R10+**: HTTP/3, OCSP/CRL fetch and distributed revocation,
+* **Still R11+**: HTTP/3, live OCSP/CRL fetch and distributed revocation,
   permessage-deflate, a sized connection pool with a shared event loop, and
   load-balancer integration.
 
@@ -434,7 +443,7 @@ is refused with an `unknown_ca` alert. The server writes a concrete line to
 stderr, for example:
 
 ```
-[opurom-server] mTLS handshake refused: client certificate missing, untrusted or revoked (check OPR_CLIENT_CA and OPR_REVOKED): peer sent no certificates
+[opurom-server] mTLS handshake refused: client certificate missing, untrusted, revoked or status unavailable (check OPR_CLIENT_CA, OPR_REVOKED, OPR_CRL_FILE and OPR_OCSP_FILE): peer sent no certificates
 ```
 
 A trusted client receives the negotiated response: unchanged HTTP/1.1 for
@@ -454,11 +463,11 @@ a match. The fingerprint is computed from the presented peer certificate DER,
 never from an HTTP header or another client-supplied string. A test proves
 that a spoofed `X-Client-Cert-Fingerprint` header does not bypass the list.
 
-**This is NOT OCSP, OCSP stapling, a distributed CRL, a CRL distribution
-point or any network fetch.** There is no live status, expiry or distribution:
-a certificate is denied only because an operator listed its fingerprint in
-one process-local environment variable at startup. An invalid fingerprint is
-a startup error rather than a silently ignored entry.
+**The deny list itself is NOT OCSP, OCSP stapling, a distributed CRL, a CRL
+distribution point or any network fetch.** R10 adds separate required static
+local DER CRL/OCSP status sources; it does not give this fingerprint list live
+status, expiry or distribution. An invalid fingerprint is a startup error
+rather than a silently ignored entry.
 
 ### ALPN negotiation and reporting
 
@@ -481,13 +490,14 @@ log fields with `"alpn":"h2"`.
 * R8 had no HTTP/2 frame implementation; R9 adds HPACK, HEADERS/DATA frames,
   streams and flow control. There is still no client-controlled priority tree
   or HTTP/3/QUIC.
-* No OCSP, OCSP stapling, CRL fetch, distributed revocation, certificate
-  status protocol or revocation cache of any kind.
+* R8 itself had no OCSP, OCSP stapling, CRL fetch, distributed revocation,
+  certificate status protocol or revocation cache. R10 adds required static
+  local DER CRL/OCSP checks, still without any live fetch or cache.
 * No HSM, no private-key isolation, no certificate transparency, no SCT
   validation and no cipher-suite tuning beyond the rustls defaults.
 * The client CA and the deny list are static, process-local configuration;
   there is no identity store, no per-client authorization and no rotation.
-* Still R10+: HTTP/3/QUIC, OCSP/CRL fetch, distributed revocation, HSM,
+* Still R11+: HTTP/3/QUIC, live OCSP/CRL fetch, distributed revocation, HSM,
   certificate transparency, permessage-deflate, a sized connection pool and
   load-balancer integration.
 
@@ -537,7 +547,53 @@ Honest scope: no HTTP/3/QUIC, no server push, no client-controlled priority
 tree, no connection coalescing across origins, no h2 extended CONNECT or
 WebSocket-over-h2 upgrade, and no trailers. There is no application-level
 streaming: each response body is built in memory before h2 frames it. These
-remain R10+.
+remain R11+.
+
+## R10 certificate status (opt-in)
+
+R10 adds real certificate status checks to the same rustls mTLS listener. It
+does not replace the R8 fingerprint deny list and it fetches nothing: status
+sources are local DER files named at startup and read again at each handshake.
+With neither variable set, the R9 mTLS path is unchanged, including
+byte-identical HTTP/1.1 answers.
+
+| Variable | Effect |
+| --- | --- |
+| `OPR_CRL_FILE` | required local DER X.509 v2 CRL |
+| `OPR_OCSP_FILE` | required local DER `BasicOCSPResponse` |
+
+Both variables are read only when `OPR_MTLS=1`. A configured source is
+required: a missing, unreadable, empty or oversized file, malformed DER, an
+unverifiable signature, a mismatched issuer, a stale `nextUpdate`, a future
+`thisUpdate`/`producedAt`, an OCSP `unknown` status or a serial with no OCSP
+entry refuses the handshake. A CRL that names the presented client serial or
+an OCSP `revoked` status refuses it; a non-revoked CRL entry and/or an OCSP
+`good` status lets the already-verified chain complete.
+
+The CRL is parsed with `x509-parser` 0.18.1. The OCSP response uses a strict,
+definite-length DER reader for `BasicOCSPResponse`, `ResponseData`,
+`SingleResponse`, `CertID` and `CertStatus` (`good` / `revoked` / `unknown`).
+SHA-256 `CertID` hashes of the CA subject Name and subject public key are
+compared with the configured `OPR_CLIENT_CA`, and both CRL and OCSP signatures
+are verified against that CA's public key through `x509-parser`'s
+`ring`-backed verifier. Serials are compared as canonical positive DER
+INTEGERs. Every DER input is capped at `cert_status::MAX_STATUS_DER_BYTES`
+(256 KiB); files are read through a bounded `take`, serials at 20 octets,
+OCSP responses at 64 `SingleResponse` entries, and indefinite or non-minimal
+DER lengths are rejected before slicing.
+
+Tests generate a CA, a CA-signed server chain, two CA-signed clients, DER CRLs
+and CA-signed OCSP responses with `rcgen` in memory; local DER files are
+written only under the ignored `target/` tree at test runtime. A
+revoked-but-otherwise-trusted client is refused over a real socket, a good
+client gets `200`, and missing, malformed, stale, tampered, oversized and
+unknown-status sources all fail closed. No private keys are checked in.
+
+Honest scope: static local status sources only; no live OCSP responder fetch,
+no CRL distribution point fetch, no OCSP stapling, no delegated OCSP
+responder certificates, no status cache, no nonce, no certificate
+transparency/SCT validation, no distributed revocation, no HSM/private-key
+isolation and no cipher-suite tuning. These remain R11+.
 
 ## Generated service (`opurom-serverc`)
 
@@ -567,8 +623,10 @@ The generator writes a standalone crate into `<dir>`:
   through the runtime described above. The R7 transport variables
   `OPR_TLS`, `OPR_TLS_CERT`, `OPR_TLS_KEY`, `OPR_KEEPALIVE` and
   `OPR_WEBSOCKET` work the same way. The R8 TLS variables `OPR_MTLS`,
-  `OPR_CLIENT_CA` and `OPR_REVOKED` work the same way too. R9 h2 is selected
-  by ALPN on those TLS listeners; it needs no new variable.
+  `OPR_CLIENT_CA` and `OPR_REVOKED` work the same way too. The R10 status
+  variables `OPR_CRL_FILE` and `OPR_OCSP_FILE` are required local DER sources
+  on those mTLS listeners. R9 h2 is selected by ALPN on those TLS listeners;
+  it needs no new variable.
 * The schema is created at startup inside one `PooledDb::with` call: every
   `migrations/*.sql` statement is embedded with `include_str!` and executed
   (they are `CREATE TABLE IF NOT EXISTS`, so startup is idempotent).
@@ -582,7 +640,7 @@ OPR_PORT=8787 OPR_DB=./opurom.db <dir>/target/release/opurom-service
 
 The generated service no longer opens one connection per request. It shares
 the one Mutex-serialized connection from `PooledDb`; real connection pool
-sizing remains R10+.
+sizing remains R11+.
 
 ## Demo server
 
@@ -605,8 +663,8 @@ OPR_MTLS=1 OPR_CLIENT_CA=client-ca.pem OPR_LOG_JSON=1 \
 ## Dependencies
 
 The R7 transport features add seven pinned dependencies; R8 adds none; R9
-adds five pinned dependencies. Every direct version is pinned with `=` so a
-rebuild cannot pull a different release.
+adds five pinned dependencies; R10 adds one. Every direct version is pinned
+with `=` so a rebuild cannot pull a different release.
 
 | Crate | Version | Why |
 | --- | --- | --- |
@@ -622,10 +680,13 @@ rebuild cannot pull a different release.
 | `bytes` | 1.12.1 | bounded DATA frame buffers |
 | `tokio` | 1.54.1 | current-thread runtime, sockets, timers and task sets for h2 connections |
 | `tokio-rustls` | 0.26.6 | async TLS handshake exposing the selected ALPN protocol |
+| `x509-parser` | 0.18.1 | DER X.509/CRL parsing and `ring`-backed status signature verification |
 
 `rcgen` is built with `default-features = false` and only the `crypto`,
 `pem` and `ring` features, so its optional `x509-parser` and `aws-lc-rs`
-paths are not compiled in. `rustls` is built with `default-features = false`
+paths are not compiled in. R10 enables `x509-parser`'s `verify` feature
+directly; it reuses the same `ring` version that rustls already brings in.
+`rustls` is built with `default-features = false`
 and only `ring`, `std`, `tls12` and `logging`, so no system TLS library is
 needed. `tokio` uses `default-features = false` with only `io-util`, `macros`,
 `net`, `rt`, `sync` and `time`; `tokio-rustls` uses `default-features = false`
@@ -639,8 +700,9 @@ cargo test
 ```
 
 All 67 R7 tests remain green: 37 from R6 and 30 from R7. The R8 suite adds
-9 more, for 76 in total; R9 adds 3, for 79. Several suites drive a real server
-on an ephemeral port over TCP:
+9 more, for 76 in total; R9 adds 3, for 79. R10 adds 14 (3 DER-reader unit
+tests, 10 real-socket status tests and 1 environment-file test), for 93.
+Several suites drive a real server on an ephemeral port over TCP:
 
 | Test file | Covers |
 | --- | --- |
@@ -654,6 +716,9 @@ on an ephemeral port over TCP:
 | `tests/keepalive.rs` | two requests on one socket, a `Connection: close` request ending the connection, the idle timeout closing a silent connection, the in-flight limit answering 503, the documented default limits, the demo server with and without `OPR_KEEPALIVE` |
 | `tests/mtls.rs` | real sockets with an rcgen CA -> server chain -> client cert chain, `OPR_MTLS=1` alone enabling TLS, a trusted client accepted, missing and self-signed untrusted clients refused, a revoked-but-trusted cert refused and a non-revoked one accepted, a spoofed fingerprint header ignored, `h2`/`http/1.1` ALPN selection with a real h2 client for `h2`, the structured log `alpn` field, clear mTLS refusal diagnostics, and the byte-identical R7 single-sided TLS answer |
 | `tests/http2.rs` | `h2_concurrent_streams_share_one_tls_connection`, `h2_large_body_flow_control_isolates_failed_stream` and `h2_shutdown_sends_graceful_goaway`: one real h2 client connection with several concurrent streams, exact statuses/bodies and R5 response features, 256 KiB response and 128 KiB request across flow-control windows, panic isolation, and raw-frame initial/final GOAWAY with PING/PONG |
+| `src/cert_status.rs` | DER GeneralizedTime, canonical serial and strict DER-length unit tests |
+| `tests/cert_status.rs` | real mTLS sockets with rcgen CRL/OCSP fixtures: `crl_revoked_serial_is_refused_and_good_client_is_accepted`, `crl_stale_or_tampered_der_fails_closed`, `crl_malformed_or_oversized_der_fails_closed`, `ocsp_good_status_is_accepted_and_revoked_status_is_refused`, `ocsp_unknown_and_wrong_serial_fail_closed`, `ocsp_stale_or_tampered_response_fails_closed`, `ocsp_empty_env_value_fails_closed`, `ocsp_unavailable_or_malformed_file_fails_closed`, both-sources-required and byte-identical R9 default checks |
+| `tests/status_env.rs` | `crl_and_ocsp_env_files_configure_mtls`: `OPR_CRL_FILE`/`OPR_OCSP_FILE` local DER files over a real mTLS socket, with missing sources failing closed |
 
 The in-process tests are self-contained: they use an in-memory store, not
 `opurom-db`, so `cargo test` passes in this repository on its own. The
@@ -683,19 +748,20 @@ Implemented and verified in this repository:
 | TLS listener | Implemented, opt-in via `OPR_TLS=1`, rustls with a self-signed fallback, fingerprint logged, real handshake tested |
 | Real HTTP/2 | Implemented, ALPN-selected `h2` only, h2 0.4.20 frames/HPACK/multiplexing/flow control, shared router/middleware, bounded limits and graceful GOAWAY; no new environment variable |
 | Mutual TLS client certificates | Implemented, opt-in via `OPR_MTLS=1` + `OPR_CLIENT_CA`, mandatory rustls verification over real sockets |
-| Certificate revocation | Implemented as a static `OPR_REVOKED` fingerprint deny list over presented peer certificates; NOT OCSP or a distributed CRL |
+| Certificate revocation | Implemented as a static `OPR_REVOKED` fingerprint deny list plus R10 required static local DER CRL/OCSP serial status checks; no live fetch or distributed revocation |
+| Static local certificate status | Implemented, opt-in via `OPR_CRL_FILE` / `OPR_OCSP_FILE`, CA-signature-verified, bounded DER parsing, fail-closed on unavailable/malformed/stale sources |
 | ALPN negotiation and reporting | Implemented, `h2` and `http/1.1` advertised, selected protocol in the structured log; R9 serves h2 frames when `h2` is selected |
 | WebSocket (RFC 6455) | Implemented, opt-in via `OPR_WEBSOCKET=1`, handshake, text, binary, ping/pong, close and fragmentation, bounded frames |
 | HTTP/1.1 keep-alive | Implemented, opt-in via `OPR_KEEPALIVE=1`, `Content-Length` framing, idle timeout, in-flight limit |
 
-Not implemented (R10+):
+Not implemented (R11+):
 
 | Area | Status |
 | --- | --- |
 | HTTP/3 / QUIC | Not implemented (R9 h2 runs over rustls/TCP only) |
 | HTTP/2 server push, priority tree and coalescing | Not implemented (no push promises, no client-controlled priority tree and no cross-origin connection reuse) |
 | HTTP/2 extended CONNECT, WebSocket-over-h2, trailers | Not implemented (the RFC 6455 upgrade remains HTTP/1.1 only) |
-| OCSP / CRL fetch / distributed revocation | Not implemented (a static process-local fingerprint deny list only) |
+| Live OCSP responder fetch / distributed revocation | Not implemented (R10 checks required static local DER status files only) |
 | HSM and certificate transparency | Not implemented (no private-key isolation, no SCT validation) |
 | `permessage-deflate` | Not implemented (no extension is negotiated, no frame is compressed) |
 | Load-balancer integration | Not implemented (no `X-Forwarded-*`, no `Forwarded`, no proxy protocol) |

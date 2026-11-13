@@ -168,6 +168,7 @@ fn start_mtls_server(pki: &Pki, revoked: &[String]) -> (u16, Arc<std::sync::atom
     let options = MtlsOptions {
         client_ca_pem: pki.ca_pem.as_bytes().to_vec(),
         revoked: revoked.to_vec(),
+        ..MtlsOptions::default()
     };
     let config = tls::config_from_pem_bytes(
         pki.server_chain_pem.as_bytes(),
@@ -513,6 +514,8 @@ impl DemoServer {
             "OPR_MTLS",
             "OPR_CLIENT_CA",
             "OPR_REVOKED",
+            "OPR_CRL_FILE",
+            "OPR_OCSP_FILE",
         ] {
             command.env_remove(name);
         }
