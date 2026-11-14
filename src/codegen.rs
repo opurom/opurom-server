@@ -202,7 +202,7 @@ fn main_rs(ir: &Ir) -> String {
          use opurom_server::router::Router;\n\
          use opurom_server::server::Server;\n\
          use opurom_server::ssr::ssr_html;\n\
-         use opurom_server::serde_json::Value as Json;\n\n",
+         use opurom_server::serde_json::Value as Json;\n         use opurom_server::serde_json as serde_json;\n\n",
     );
 
     // Model metadata, lowered from the IR.
