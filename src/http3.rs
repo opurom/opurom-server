@@ -25,7 +25,8 @@ use h3::server::RequestResolver;
 
 use crate::http::{normalize_path, Method, Request as AppRequest, Response as AppResponse};
 use crate::middleware::{
-    structured_logging_enabled, tls_request_log_line, HttpOptions, MiddlewareChain, RateLimiter,
+    request_id_of, structured_logging_enabled, tls_access_log_line, HttpOptions, MiddlewareChain,
+    RateLimiter,
 };
 use crate::router::Router;
 use crate::server::dispatch_request;
@@ -281,13 +282,22 @@ async fn serve_request(resolver: RequestResolver<h3_quinn::Connection, Bytes>, s
         state.limiter.as_deref(),
         state.options.as_ref(),
     );
+    // The request-id layer ran inside dispatch and mirrored the id here.
+    let request_id = request_id_of(&app_request).map(str::to_string);
     send_response(&mut stream, &response, head_only).await;
 
     if structured_logging_enabled() {
-        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         eprintln!(
             "{}",
-            tls_request_log_line(&method, &path, response.status, elapsed_ms, "h3")
+            tls_access_log_line(
+                &method,
+                &path,
+                response.status,
+                duration_ms,
+                request_id.as_deref(),
+                "h3"
+            )
         );
     }
 }

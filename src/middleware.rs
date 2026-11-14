@@ -37,6 +37,11 @@ pub const ETAG_ENV: &str = "OPR_ETAG";
 /// Environment variable holding the advertised HTTP/3 UDP port.
 pub const ALT_SVC_ENV: &str = "OPR_ALT_SVC_PORT";
 
+/// Environment variable holding the `Cache-Control` value added to successful
+/// responses (2xx and 304). Unset leaves responses header-identical to the
+/// plain default, so caching stays opt-in.
+pub const CACHE_CONTROL_ENV: &str = "OPR_CACHE_CONTROL";
+
 /// Length of one deterministic rate-limit window, in seconds.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
@@ -98,7 +103,7 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|raw| truthy(&raw))
 }
 
-/// True when `OPR_LOG_JSON` is set to a truthy value.
+/// True when a structured access log is written.
 pub fn structured_logging_enabled() -> bool {
     env_flag(STRUCTURED_LOG_ENV)
 }
@@ -111,6 +116,48 @@ pub fn request_log_line(method: &str, path: &str, status: u16, elapsed_ms: u64) 
         "path": path,
         "status": status,
         "elapsed_ms": elapsed_ms,
+    })
+    .to_string()
+}
+
+/// One JSON access-log object with the extra `duration_ms` and `request_id`
+/// fields. The fields are emitted in a fixed order-proving shape:
+/// `method, path, status, duration_ms, request_id`. `request_id` is `"-"` when
+/// no id was assigned, matching the `-` placeholder of the parse-error path.
+pub fn access_log_line(
+    method: &str,
+    path: &str,
+    status: u16,
+    duration_ms: u64,
+    request_id: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "method": method,
+        "path": path,
+        "status": status,
+        "duration_ms": duration_ms,
+        "request_id": request_id.unwrap_or("-"),
+    })
+    .to_string()
+}
+
+/// One JSON access-log object for a TLS/HTTP2/HTTP3 request: the same fixed
+/// field order plus the ALPN `alpn` value reported by rustls, not inferred.
+pub fn tls_access_log_line(
+    method: &str,
+    path: &str,
+    status: u16,
+    duration_ms: u64,
+    request_id: Option<&str>,
+    alpn: &str,
+) -> String {
+    serde_json::json!({
+        "method": method,
+        "path": path,
+        "status": status,
+        "duration_ms": duration_ms,
+        "request_id": request_id.unwrap_or("-"),
+        "alpn": alpn,
     })
     .to_string()
 }
@@ -163,6 +210,50 @@ pub fn body_cap(limit: usize) -> Middleware {
 /// Body-size cap layer with the default 1 MiB limit.
 pub fn default_body_cap() -> Middleware {
     body_cap(MAX_BODY_BYTES)
+}
+
+/// Validate an inbound request-id so it can be journaled and echoed without
+/// header injection risks: 1 to 64 visible ASCII bytes, no spaces or control
+/// characters. Anything else is treated as absent.
+pub fn valid_request_id(raw: &str) -> Option<&str> {
+    let raw = raw.trim();
+    (!raw.is_empty()
+        && raw.len() <= 64
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\')))
+    .then_some(raw)
+}
+
+/// Assign every request an `X-Request-Id`: reuse a valid inbound value so a
+/// caller can correlate its own trace, otherwise mint one from a process-local
+/// counter. The assigned value is mirrored onto the request headers, where the
+/// access log and the response code read it back. This is layer 0 of the
+/// chain; it never short-circuits.
+pub fn request_id() -> Middleware {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    Arc::new(|request: &mut Request| {
+        // Keep a valid inbound id; replace (never append) a missing or hostile
+        // one so the header has exactly one trustworthy value for the log.
+        let valid = request
+            .header("X-Request-Id")
+            .and_then(valid_request_id)
+            .map(str::to_string);
+        let assigned = valid.unwrap_or_else(|| {
+            let next = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("req-{next:016x}")
+        });
+        request
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case("X-Request-Id"));
+        request.headers.push(("X-Request-Id".to_string(), assigned));
+        None
+    })
+}
+
+/// Read the request-id assigned by the [`request_id`] layer, if any.
+pub fn request_id_of(request: &Request) -> Option<&str> {
+    request.header("X-Request-Id").and_then(valid_request_id)
 }
 
 /// In-process per-route fixed-window counter.
@@ -253,6 +344,11 @@ pub struct HttpOptions {
     pub auth: AuthOptions,
     pub cors_origin: Option<String>,
     pub etag: bool,
+    /// The `Cache-Control` value added to successful (2xx/304) responses.
+    ///
+    /// `None` unless an operator sets [`CACHE_CONTROL_ENV`], so the default
+    /// response headers stay unchanged.
+    pub cache_control: Option<String>,
     /// The UDP port of the HTTP/3 endpoint, advertised with `Alt-Svc`.
     ///
     /// The value is `None` unless an operator sets [`ALT_SVC_ENV`], so the
@@ -281,10 +377,20 @@ impl HttpOptions {
             auth,
             cors_origin,
             etag,
+            cache_control: cache_control_from_env(),
             alt_svc_port: alt_svc_port_from_env(),
             tls: crate::tls::tls_enabled(),
         }
     }
+}
+
+/// Read the `Cache-Control` value from [`CACHE_CONTROL_ENV`]. An empty value
+/// disables the header instead of adding an empty one.
+pub fn cache_control_from_env() -> Option<String> {
+    std::env::var(CACHE_CONTROL_ENV)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
 }
 
 /// Read the advertised HTTP/3 UDP port from [`ALT_SVC_ENV`].
@@ -505,10 +611,31 @@ pub fn alt_svc_header_value(port: u16) -> String {
     format!("h3=\":{}\"", port)
 }
 
+/// The ordered response stages that turn a routed [`Response`] into the wire
+/// answer. Each stage is independently testable and runs in this fixed order:
+///
+/// 1. [`Alt-Svc`](stage_alt_svc) - advertise the HTTP/3 endpoint on TLS.
+/// 2. [`CORS`](stage_cors) - fixed `Access-Control-Allow-Origin` plus `Vary`.
+/// 3. [`Cache-Control`](stage_cache_control) - configurable caching header.
+/// 4. [`ETag`](stage_etag) - body-hash validator and conditional `304`.
+/// 5. [`gzip`](stage_compression) - compress an accepted, large body.
+///
+/// The order is observable because compression runs last: the `ETag` is the
+/// hash of the *uncompressed* body, so it is identical with or without
+/// `gzip`, and a `304` never carries a `Content-Encoding`.
+pub const RESPONSE_STAGES: [&str; 5] = ["alt-svc", "cors", "cache-control", "etag", "gzip"];
+
 /// Apply the opt-in HTTP response features to a completed response.
 pub fn apply_response_features(response: &mut Response, request: &Request, options: &HttpOptions) {
-    // An alternative service is advertised only on a TLS listener, because
-    // the client must reach the advertised endpoint over the same origin.
+    stage_alt_svc(response, options);
+    stage_cors(response, options);
+    stage_cache_control(response, options);
+    stage_etag(response, request, options);
+    stage_compression(response, request);
+}
+
+/// Stage 1: advertise the HTTP/3 endpoint with `Alt-Svc` on a TLS listener.
+pub fn stage_alt_svc(response: &mut Response, options: &HttpOptions) {
     if options.tls {
         if let Some(port) = options.alt_svc_port {
             if !has_header(response, "Alt-Svc") {
@@ -516,39 +643,74 @@ pub fn apply_response_features(response: &mut Response, request: &Request, optio
             }
         }
     }
+}
 
+/// Stage 2: fixed-origin CORS headers. The requested `Origin` is never used to
+/// build a response header; `Vary: Origin` makes that explicit to caches.
+pub fn stage_cors(response: &mut Response, options: &HttpOptions) {
     if let Some(origin) = options.cors_origin.as_deref() {
         if !has_header(response, "Access-Control-Allow-Origin") {
             response.set_header("Access-Control-Allow-Origin", origin);
         }
         add_vary(response, "Origin");
     }
+}
 
-    if options.etag
-        && (200..300).contains(&response.status)
-        && !response.body.is_empty()
-        && !has_header(response, "ETag")
-    {
-        let etag = etag_for(&response.body);
-        response.set_header("ETag", &etag);
-        if request.method == Method::Get
-            && request
-                .header("If-None-Match")
-                .is_some_and(|raw| if_none_match_matches(raw, &etag))
-        {
-            response.status = 304;
-            response.body.clear();
-            response.headers.retain(|(name, _)| {
-                name.eq_ignore_ascii_case("ETag")
-                    || name.eq_ignore_ascii_case("Vary")
-                    || name
-                        .get(.."Access-Control-".len())
-                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Access-Control-"))
-            });
-            return;
+/// Stage 3: add the configured `Cache-Control` value to a successful response
+/// (2xx or 304) that does not already carry one.
+pub fn stage_cache_control(response: &mut Response, options: &HttpOptions) {
+    if let Some(value) = options.cache_control.as_deref() {
+        let successful = (200..300).contains(&response.status) || response.status == 304;
+        if successful && !has_header(response, "Cache-Control") {
+            response.set_header("Cache-Control", value);
         }
     }
+}
 
+/// Stage 4: add an `ETag` from the body hash and answer a matching
+/// `If-None-Match` with a bodyless `304`. Runs before compression so the hash
+/// always describes the uncompressed bytes, and a malformed validator simply
+/// fails to match (leaving a `200`), never a `500`.
+pub fn stage_etag(response: &mut Response, request: &Request, options: &HttpOptions) {
+    if !options.etag
+        || !(200..300).contains(&response.status)
+        || response.body.is_empty()
+        || has_header(response, "ETag")
+    {
+        return;
+    }
+    let etag = etag_for(&response.body);
+    response.set_header("ETag", &etag);
+    if request.method == Method::Get
+        && request
+            .header("If-None-Match")
+            .is_some_and(|raw| if_none_match_matches(raw, &etag))
+    {
+        // The representation the 304 stands in for would have been gzipped for
+        // this client, so a shared cache must still vary on Accept-Encoding.
+        let compresses = accepts_gzip(request) && response.body.len() > GZIP_THRESHOLD_BYTES;
+        response.status = 304;
+        response.body.clear();
+        // A 304 keeps its validator, the cache-control value and any Vary
+        // field, but drops representation headers such as Content-Type.
+        response.headers.retain(|(name, _)| {
+            name.eq_ignore_ascii_case("ETag")
+                || name.eq_ignore_ascii_case("Vary")
+                || name.eq_ignore_ascii_case("Cache-Control")
+                || name
+                    .get(.."Access-Control-".len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Access-Control-"))
+        });
+        if compresses {
+            add_vary(response, "Accept-Encoding");
+        }
+    }
+}
+
+/// Stage 5: gzip a body the client accepts when it exceeds the threshold.
+/// `Vary: Accept-Encoding` records the negotiation so a shared cache does not
+/// serve one encoding to the other kind of client.
+pub fn stage_compression(response: &mut Response, request: &Request) {
     if accepts_gzip(request)
         && response.body.len() > GZIP_THRESHOLD_BYTES
         && !has_header(response, "Content-Encoding")

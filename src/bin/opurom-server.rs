@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use opurom_server::http::{Method, Request, Response};
-use opurom_server::middleware::{body_cap, logging, MiddlewareChain};
+use opurom_server::middleware::{body_cap, logging, request_id, MiddlewareChain};
 use opurom_server::query::ListQuery;
 use opurom_server::router::Router;
 use opurom_server::server::Server;
@@ -49,6 +49,9 @@ fn main() {
 
     let router = demo_router();
     let mut chain = MiddlewareChain::new();
+    // Layer order is the pipeline order: request-id is assigned first so the
+    // access log can correlate it, then the plain log line, then the body cap.
+    chain.push(request_id());
     chain.push(logging());
     chain.push(body_cap(1024 * 1024));
 

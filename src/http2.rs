@@ -31,7 +31,8 @@ use tokio_rustls::server::TlsStream;
 
 use crate::http::{normalize_path, Method, Request as AppRequest, Response as AppResponse};
 use crate::middleware::{
-    structured_logging_enabled, tls_request_log_line, HttpOptions, MiddlewareChain, RateLimiter,
+    request_id_of, structured_logging_enabled, tls_access_log_line, HttpOptions, MiddlewareChain,
+    RateLimiter,
 };
 use crate::router::Router;
 use crate::server::dispatch_request;
@@ -170,16 +171,25 @@ async fn serve_stream(
             // frames and returns the connection flow window.
             None => return,
         };
+    // The request-id layer ran inside dispatch and mirrored the id here.
+    let request_id = request_id_of(&app_request).map(str::to_string);
 
     if let Err(err) = send_response(&mut respond, &response, head_only).await {
         eprintln!("[opurom-server] HTTP/2 stream failed: {}", err);
         return;
     }
     if structured_logging_enabled() {
-        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         eprintln!(
             "{}",
-            tls_request_log_line(&method, &path, response.status, elapsed_ms, "h2")
+            tls_access_log_line(
+                &method,
+                &path,
+                response.status,
+                duration_ms,
+                request_id.as_deref(),
+                "h2"
+            )
         );
     }
 }

@@ -225,7 +225,15 @@ fn structured_logging_writes_one_json_line_to_stderr() {
     assert_eq!(value["method"], "GET");
     assert_eq!(value["path"], "/health");
     assert_eq!(value["status"], 200);
-    assert!(value["elapsed_ms"].is_u64(), "{}", line);
+    assert!(value["duration_ms"].is_u64(), "{}", line);
+    // The request-id layer assigns and echoes an id, so it reaches the log.
+    assert!(
+        value["request_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "{}",
+        line
+    );
 
     let stderr = server.stderr();
     assert_eq!(
