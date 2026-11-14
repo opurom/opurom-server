@@ -36,9 +36,9 @@ use tokio_rustls::TlsAcceptor;
 use crate::http::{read_request, status_text, Method, Request, Response, MAX_BODY_BYTES};
 use crate::http2::{self, State as H2State};
 use crate::middleware::{
-    apply_response_features, cors_preflight, rate_limited_response, request_log_line,
-    structured_logging_enabled, tls_request_log_line, unauthorized_response, AuthOptions,
-    HttpOptions, MiddlewareChain, RateLimiter,
+    access_log_line, apply_response_features, cors_preflight, rate_limited_response, request_id_of,
+    structured_logging_enabled, tls_access_log_line, unauthorized_response, valid_request_id,
+    AuthOptions, HttpOptions, MiddlewareChain, RateLimiter,
 };
 use crate::router::Router;
 use crate::tls::{self, TlsConfig};
@@ -526,43 +526,77 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
         }
 
         let started = Instant::now();
-        let (response, method, path, reuse, head_only) = match read_request(&mut reader, max_body) {
-            Ok(mut request) => {
-                // A WebSocket upgrade takes over the connection.
-                if websocket {
-                    if let Some(key) = websocket::upgrade_key(&request) {
-                        return serve_websocket(&mut reader, key);
+        let (response, method, path, reuse, head_only, request_id) =
+            match read_request(&mut reader, max_body) {
+                Ok(mut request) => {
+                    // A WebSocket upgrade takes over the connection.
+                    if websocket {
+                        if let Some(key) = websocket::upgrade_key(&request) {
+                            return serve_websocket(&mut reader, key);
+                        }
                     }
+                    let method = request.method.as_str().to_string();
+                    let path = request.path.clone();
+                    let head_only = request.method == Method::Head;
+                    // Capture a client-supplied id before dispatch, because the
+                    // request-id layer overwrites the header with the assigned id.
+                    let client_id = request
+                        .header("X-Request-Id")
+                        .and_then(valid_request_id)
+                        .map(str::to_string);
+                    let mut response = dispatch_request(
+                        &mut request,
+                        router.as_ref(),
+                        middleware.as_ref(),
+                        limiter.as_deref(),
+                        options.as_ref(),
+                    );
+                    // The request-id layer runs inside dispatch and mirrors the id
+                    // onto the request headers, so read it back only afterwards.
+                    let request_id = request_id_of(&request).map(str::to_string);
+                    // Echo only a valid client-supplied id so a caller can
+                    // correlate its trace. A minted id stays access-log-only,
+                    // keeping a plain no-id response byte-identical.
+                    if let Some(id) = client_id.as_deref() {
+                        if !response
+                            .headers
+                            .iter()
+                            .any(|(name, _)| name.eq_ignore_ascii_case("X-Request-Id"))
+                        {
+                            response.set_header("X-Request-Id", id);
+                        }
+                    }
+                    let reuse = keep_alive && wants_keep_alive(&request);
+                    (response, method, path, reuse, head_only, request_id)
                 }
-                let method = request.method.as_str().to_string();
-                let path = request.path.clone();
-                let head_only = request.method == Method::Head;
-                let response = dispatch_request(
-                    &mut request,
-                    router.as_ref(),
-                    middleware.as_ref(),
-                    limiter.as_deref(),
-                    options.as_ref(),
-                );
-                let reuse = keep_alive && wants_keep_alive(&request);
-                (response, method, path, reuse, head_only)
-            }
-            Err(err) => (
-                Response::error(err.status, &err.message),
-                "-".to_string(),
-                "-".to_string(),
-                false,
-                false,
-            ),
-        };
+                Err(err) => (
+                    Response::error(err.status, &err.message),
+                    "-".to_string(),
+                    "-".to_string(),
+                    false,
+                    false,
+                    None,
+                ),
+            };
         let result = write_response_head_aware(reader.get_mut(), &response, reuse, head_only);
         if structured_logging_enabled() {
-            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let line = match alpn.as_deref() {
-                Some(protocol) => {
-                    tls_request_log_line(&method, &path, response.status, elapsed_ms, protocol)
-                }
-                None => request_log_line(&method, &path, response.status, elapsed_ms),
+                Some(protocol) => tls_access_log_line(
+                    &method,
+                    &path,
+                    response.status,
+                    duration_ms,
+                    request_id.as_deref(),
+                    protocol,
+                ),
+                None => access_log_line(
+                    &method,
+                    &path,
+                    response.status,
+                    duration_ms,
+                    request_id.as_deref(),
+                ),
             };
             eprintln!("{}", line);
         }

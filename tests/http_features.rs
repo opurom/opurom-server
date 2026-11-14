@@ -277,7 +277,8 @@ fn json_statuses(lines: &[String], path: &str) -> Vec<u64> {
             let value: Json = serde_json::from_str(line).expect("valid JSON log line");
             assert_eq!(value["method"], "GET");
             assert_eq!(value["path"], path);
-            assert!(value["elapsed_ms"].is_u64(), "{}", line);
+            assert!(value["duration_ms"].is_u64(), "{}", line);
+            assert!(value["request_id"].is_string(), "{}", line);
             value["status"].as_u64().expect("numeric status")
         })
         .collect();
@@ -871,7 +872,8 @@ fn preflight_bypasses_auth_but_counts_and_logs() {
             let value: Json = serde_json::from_str(line).expect("valid JSON log line");
             assert_eq!(value["method"], "OPTIONS");
             assert_eq!(value["path"], "/health");
-            assert!(value["elapsed_ms"].is_u64(), "{}", line);
+            assert!(value["duration_ms"].is_u64(), "{}", line);
+            assert!(value["request_id"].is_string(), "{}", line);
             value["status"].as_u64().expect("numeric status")
         })
         .collect();

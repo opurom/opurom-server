@@ -7,7 +7,8 @@
 //! * [`http2`] - real HTTP/2 frames over an ALPN-selected TLS connection.
 //! * [`http3`] - real HTTP/3 over QUIC on a separate UDP listener.
 //! * [`router`] - literal and `:param` routing with per-route fault isolation.
-//! * [`middleware`] - middleware, rate limiting, logs and opt-in HTTP features.
+//! * [`middleware`] - an ordered request/response pipeline (request-id, access
+//!   log, ETag/304, gzip, Cache-Control), rate limiting and opt-in features.
 //! * [`query`] - strict list query parsing, stable ordering and the list envelope.
 //! * [`server`] - a thread-per-connection `TcpListener` server with optional
 //!   TLS, ALPN-selected HTTP/2 and HTTP/1.1 keep-alive.
@@ -46,11 +47,14 @@ pub use http3::{
     HTTP3_PORT_ENV,
 };
 pub use middleware::{
-    alt_svc_header_value, alt_svc_port_from_env, constant_time_eq, cors_origin_from_env_value,
-    etag_for, rate_limit, rate_limit_from_env, rate_limited_response, request_log_line,
-    structured_logging_enabled, tls_request_log_line, unauthorized_response, AuthOptions,
-    HttpOptions, MiddlewareChain, RateLimiter, ALT_SVC_ENV, AUTH_TOKEN_ENV, CORS_ENV, ETAG_ENV,
-    GZIP_THRESHOLD_BYTES, HEALTH_PATH, RATE_LIMIT_ENV, RATE_LIMIT_WINDOW_SECS, STRUCTURED_LOG_ENV,
+    access_log_line, alt_svc_header_value, alt_svc_port_from_env, cache_control_from_env,
+    constant_time_eq, cors_origin_from_env_value, etag_for, rate_limit, rate_limit_from_env,
+    rate_limited_response, request_id, request_id_of, request_log_line, stage_alt_svc,
+    stage_cache_control, stage_compression, stage_cors, stage_etag, structured_logging_enabled,
+    tls_access_log_line, tls_request_log_line, unauthorized_response, valid_request_id,
+    AuthOptions, HttpOptions, MiddlewareChain, RateLimiter, ALT_SVC_ENV, AUTH_TOKEN_ENV,
+    CACHE_CONTROL_ENV, CORS_ENV, ETAG_ENV, GZIP_THRESHOLD_BYTES, HEALTH_PATH, RATE_LIMIT_ENV,
+    RATE_LIMIT_WINDOW_SECS, RESPONSE_STAGES, STRUCTURED_LOG_ENV,
 };
 pub use query::{ListQuery, QueryError, DEFAULT_LIMIT, MAX_LIMIT, MAX_OFFSET};
 pub use router::{RegisteredRoute, Router};
