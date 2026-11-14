@@ -470,6 +470,7 @@ pub mod client {
     use super::{accept_key, encode_frame, read_frame, MessageReader, Opcode, WsError, WsMessage};
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
+    use std::time::Duration;
 
     /// A client-side WebSocket connection over one TCP socket.
     #[derive(Debug)]
@@ -538,6 +539,12 @@ pub mod client {
                 writer,
                 messages: MessageReader::new(),
             })
+        }
+
+        /// Set the socket read timeout, so a test can assert that no frame arrives.
+        pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), WsError> {
+            self.reader.get_ref().set_read_timeout(timeout)?;
+            Ok(())
         }
 
         /// Send one masked text frame.
