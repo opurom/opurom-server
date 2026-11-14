@@ -9,6 +9,8 @@
 //! * [`router`] - literal and `:param` routing with per-route fault isolation.
 //! * [`middleware`] - an ordered request/response pipeline (request-id, access
 //!   log, ETag/304, gzip, Cache-Control), rate limiting and opt-in features.
+//! * [`pool`] - bounded TCP connection admission with FIFO slot reuse,
+//!   injected integer ticks and cumulative metrics.
 //! * [`query`] - strict list query parsing, stable ordering and the list envelope.
 //! * [`rooms`] - bounded, deterministic WebSocket room membership and recipients.
 //! * [`server`] - a thread-per-connection `TcpListener` server with optional
@@ -30,6 +32,7 @@ pub mod http2;
 pub mod http3;
 pub mod ir;
 pub mod middleware;
+pub mod pool;
 pub mod query;
 pub mod rooms;
 pub mod router;
@@ -58,6 +61,7 @@ pub use middleware::{
     CACHE_CONTROL_ENV, CORS_ENV, ETAG_ENV, GZIP_THRESHOLD_BYTES, HEALTH_PATH, RATE_LIMIT_ENV,
     RATE_LIMIT_WINDOW_SECS, RESPONSE_STAGES, STRUCTURED_LOG_ENV,
 };
+pub use pool::{ConnectionPool, Lease, PoolError, PoolMetrics, DEFAULT_IDLE_TIMEOUT_MS};
 pub use query::{ListQuery, QueryError, DEFAULT_LIMIT, MAX_LIMIT, MAX_OFFSET};
 pub use rooms::{
     validate_room_name, RoomError, RoomRegistry, MAX_ROOMS, MAX_ROOM_MEMBERS, MAX_ROOM_NAME_BYTES,

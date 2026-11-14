@@ -12,17 +12,17 @@ an HTTP CRL distribution point with a refreshable cache, and
 Rust service crate.
 
 This crate implements the backend half of
-[`the framework implementation`](the framework implementation) framework rules,
-[`the toolchain implementation`](the toolchain implementation)
+`the framework implementation` in the framework rules,
+`the toolchain implementation` in the framework rules
 framework rules,
-[`the GPU implementation`](the GPU implementation) framework rules,
-[`the network implementation`](the network implementation) framework rules and 5,
-[`the surface implementation`](the surface implementation)
+`the GPU implementation` in the framework rules framework rules,
+`the network implementation` in the framework rules framework rules and 5,
+`the surface implementation` in the framework rules
 framework rules,
-[`the framework rules`](the framework rules) framework rules,
-[`the component catalog rules`](the component catalog rules)
+`the framework rules` in the framework rules framework rules,
+`the component catalog rules` in the framework rules
 framework rules and
-[`TRANSPORT_AND_the language rules`](TRANSPORT_AND_the language rules)
+`the transport implementation` in the framework rules
 framework rules.
 
 ## Architecture
@@ -56,7 +56,9 @@ TCP/HTTP request -> HTTP/1.1 parser, HTTP/2 mapping or HTTP/3 mapping
 The transport layer wraps that core:
 
 ```
-accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
+accept -> pool::ConnectionPool admission (integer ticks, FIFO slot reuse)
+           full pool -> 503 {"error":"server_busy"}
+        -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
            OPR_MTLS=1: require a client certificate, apply the static deny list
             and every required DER CRL/OCSP status source (local or HTTP)
            ALPN: advertise h2/http/1.1, report the selected protocol
@@ -66,7 +68,7 @@ accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
           -> same middleware/router/response features
        -> http/1.1 or no ALPN: optional WebSocket upgrade (RFC 6455, OPR_WEBSOCKET=1)
        -> HTTP/1.1 keep-alive loop (OPR_KEEPALIVE=1)
-          Content-Length framing, idle timeout, in-flight limit
+          Content-Length framing, idle timeout, pool slot release
 ```
 
 | Module | Responsibility |
@@ -75,6 +77,7 @@ accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
 | `http2` | ALPN-selected HTTP/2: h2 HEADERS/DATA, HPACK, stream multiplexing, flow control, bounded settings, graceful GOAWAY and mapping into the shared request pipeline |
 | `http3` | HTTP/3 over QUIC on a separate UDP listener: the TLS 1.3 and ALPN `h3` endpoint, the real h3 request/response exchange and mapping into the shared request pipeline |
 | `middleware` | `MiddlewareChain`, `RateLimiter`, logging helpers, body cap, opt-in HTTP options |
+| `pool` | bounded TCP connection admission, FIFO slot reuse, monotonic lease ids, metrics and the fixed overload response |
 | `router` | route table, `:param` matching, panic isolation, 3-strike breaker, route introspection |
 | `query` | strict list query parsing (`limit`, `offset`, `sort`, `order`, `q`), stable ordering and the `{items,total,count,limit,offset}` envelope |
 | `server` | `TcpListener` accept loop, one thread per connection, optional TLS, ALPN-selected HTTP/2, optional keep-alive, optional WebSocket upgrade with ordered room queues, opt-in response features and measured JSON log |
@@ -158,7 +161,7 @@ tooling can enumerate verbs and paths without keeping a second list.
 | CORS preflight (`OPR_CORS`) | 204 | empty |
 | Handler panic | 500 | `{"error":"handler_panic"}` |
 | Route disabled after 3 panics | 503 | `{"error":"route_disabled"}` |
-| Too many in-flight connections | 503 | `{"error":"server_busy"}` |
+| Connection pool full | 503 | `{"error":"server_busy"}` plus `X-Connection-Pool-Reason: connection_pool_full` |
 
 Row objects use the model field names exactly; a `bool` field is a JSON boolean.
 
@@ -190,6 +193,22 @@ requests in a window are allowed; request N+1 gets `429` JSON and a
 Invalid or non-positive values disable rate limiting. The counter is protected
 by a Mutex and shared across server threads, but it is process-local: there is
 no distributed rate limit.
+
+### Connection pool
+
+The listener admits TCP connections through `pool::ConnectionPool`.
+`Server::with_max_connections` sets the cap and `Server::with_idle_timeout`
+sets the idle timeout in milliseconds. Released slots are reused in FIFO order
+and every admitted connection gets a monotonically increasing lease id. The
+pool makes decisions only from caller-supplied integer ticks; `Server` injects
+monotonic ticks. `ConnectionPool::metrics()` reports `accepted`, `rejected`,
+`reused` and `peak`.
+
+A connection that arrives when the pool is full gets `503 {"error":"server_busy"}`
+plus `X-Connection-Pool-Reason: connection_pool_full` and is closed. The
+response is deterministic: it does not wait, drop silently, or change with the
+request. `ConnectionPool::parse` rejects malformed, zero and negative limits
+with `PoolError::InvalidLimit`.
 
 ### Structured request logging
 
@@ -481,10 +500,11 @@ Two bounds keep a long-lived connection from holding resources forever:
   `server::DEFAULT_IDLE_TIMEOUT` (30 seconds) for its next request is
   closed. The timeout is also the socket read timeout, so an incomplete
   request gets `408` before the connection closes.
-* **Maximum in-flight connections**: at most
-  `server::DEFAULT_MAX_CONNECTIONS` (256) connections are served at the
+* **Maximum active connections**: at most
+  `server::DEFAULT_MAX_CONNECTIONS` (256) connections are admitted at the
   same time. A connection that arrives above the limit gets
-  `503 {"error":"server_busy"}` and is closed.
+  `503 {"error":"server_busy"}` and is closed. See the connection pool
+  section above.
 
 Both values are settable in code with `Server::with_idle_timeout` and
 `Server::with_max_connections`.
@@ -515,8 +535,8 @@ Both values are settable in code with `Server::with_idle_timeout` and
 * **The self-signed certificate is for development**: it is generated in
   memory at startup, is not written to disk, and is not rotated.
 * **The keep-alive loop is per connection**: one thread per connection is
-  still the model, so the idle timeout bounds each thread rather than a
-  shared pool.
+  still the model, so the idle timeout bounds each thread and the connection
+  pool bounds admission rather than sharing worker threads.
 ## Mutual TLS, revocation and ALPN (opt-in)
 
 The mutual-TLS features extend the same rustls listener. Plain HTTP is
@@ -917,9 +937,10 @@ cargo fmt --all
 cargo test
 ```
 
-`cargo test` runs 141 tests: the base HTTP, request-contract, SSR, hardening, codegen,
+`cargo test` runs 172 tests: the base HTTP, request-contract, SSR, hardening, codegen,
 router-introspection and list-query/auth suites plus the opt-in HTTP, TLS,
-WebSocket, keep-alive, mutual-TLS, HTTP/2, HTTP/3 and certificate-status suites.
+WebSocket, keep-alive, mutual-TLS, HTTP/2, HTTP/3, certificate-status and
+connection-pool suites.
 Several suites drive a real server on an ephemeral port over TCP:
 
 | Test file | Covers |
@@ -934,7 +955,8 @@ Several suites drive a real server on an ephemeral port over TCP:
 | `tests/http_features.rs` | 401/304/204 status and body paths, gzip bytes decompressed to the original JSON, exact 1024-byte threshold, fixed CORS headers/preflight, deterministic ETag over TCP, all-feature composition, unauthorized and preflight rate-limit/log composition, default-off wire bytes |
 | `tests/tls.rs` | a real TLS handshake over a real socket, an untrusted certificate refused by the client, the SHA-256 fingerprint and the private key never logged, a missing certificate file, a certificate without a key naming the missing variable, a corrupt PEM, a mismatched certificate and key pair, the demo server exiting with a clear error, plain HTTP staying byte-identical |
 | `tests/websocket.rs` | the RFC 6455 handshake with the documented accept value, a text frame round trip, a binary frame round trip, ping answered with pong, a close frame with its code and reason, a message reassembled from two fragments, a message reassembled from three fragments, an oversized frame refused before allocation, an unmasked client frame refused, the client refusing a wrong accept value and a non-101 answer, plus real loopback room broadcasts: three members receive the same payload, a non-member receives nothing, leave stops delivery, malformed controls return error frames while both connections survive, and room/member caps reject only the over-limit join |
-| `tests/keepalive.rs` | two requests on one socket, a `Connection: close` request ending the connection, the idle timeout closing a silent connection, the in-flight limit answering 503, the documented default limits, the demo server with and without `OPR_KEEPALIVE` |
+| `tests/keepalive.rs` | two requests on one socket, a `Connection: close` request ending the connection, the idle timeout closing a silent connection, the connection pool answering 503, the documented default limits, the demo server with and without `OPR_KEEPALIVE` |
+| `tests/connection_pool.rs` | a full pool answering the fixed 503 overload with the pool reason header, and a measured loopback batch of concurrent HTTP requests with zero lost responses |
 | `tests/mtls.rs` | real sockets with an rcgen CA -> server chain -> client cert chain, `OPR_MTLS=1` alone enabling TLS, a trusted client accepted, missing and self-signed untrusted clients refused, a revoked-but-trusted cert refused and a non-revoked one accepted, a spoofed fingerprint header ignored, `h2`/`http/1.1` ALPN selection with a real h2 client for `h2`, the structured log `alpn` field, clear mTLS refusal diagnostics, and the byte-identical single-sided TLS answer |
 | `tests/http2.rs` | `h2_concurrent_streams_share_one_tls_connection`, `h2_large_body_flow_control_isolates_failed_stream` and `h2_shutdown_sends_graceful_goaway`: one real h2 client connection with several concurrent streams, exact statuses/bodies and the opt-in response features, 256 KiB response and 128 KiB request across flow-control windows, panic isolation, and raw-frame initial/final GOAWAY with PING/PONG |
 | `src/cert_status.rs` | DER GeneralizedTime, canonical serial, strict DER-length, HTTP URL validation, HTTP status/framing bounds and CRL Distribution Points extension unit tests |
@@ -979,7 +1001,8 @@ Implemented and verified in this repository:
 | Live CRL retrieval with cache | Implemented, opt-in via `OPR_CRL_URL` (an `http://` URL or the certificate CRL Distribution Points extension), std-only HTTP client with bounded timeouts and response size, URL-keyed cache refreshed by `OPR_CRL_TTL_SECS`, fail-closed with a clear error when no valid copy exists |
 | ALPN negotiation and reporting | Implemented, `h2` and `http/1.1` advertised, selected protocol in the structured log; h2 frames are served when `h2` is selected |
 | WebSocket (RFC 6455) | Implemented, opt-in via `OPR_WEBSOCKET=1`, handshake, text, binary, ping/pong, close and fragmentation, bounded frames and process-local bounded room broadcasts |
-| HTTP/1.1 keep-alive | Implemented, opt-in via `OPR_KEEPALIVE=1`, `Content-Length` framing, idle timeout, in-flight limit |
+| Connection pool | Implemented, FIFO slot reuse, monotonic lease ids, injected integer ticks, metrics and a fixed 503 overload |
+| HTTP/1.1 keep-alive | Implemented, opt-in via `OPR_KEEPALIVE=1`, `Content-Length` framing, idle timeout, `ConnectionPool` admission limit |
 
 Out of scope for this repository:
 
@@ -992,7 +1015,7 @@ Out of scope for this repository:
 | `permessage-deflate` | no extension is negotiated, no frame is compressed |
 | Load-balancer integration | no `X-Forwarded-*`, no `Forwarded`, no proxy protocol |
 | Authentication provider / token lifecycle | one development bearer token only; no users, scopes, expiry, hashing or rotation |
-| Connection pool sizing | one shared Mutex-guarded connection, one thread per TCP connection |
+| Connection pool backends | one in-process pool; no cross-process or distributed coordination |
 | Distributed rate limiting | in-process counters only |
 | PostgreSQL / MySQL drivers | SQLite and the `opurom-db` KV/Memory drivers only |
 | Node.js / Serverless deployment | out of scope here |

@@ -1,0 +1,46 @@
+name: Release
+
+# The release train tagged this repository at its verified head and asked
+# for a release: publish one with this tag's own changelog. The train is
+# the only tagger, so this workflow never tags anything itself.
+
+on:
+  repository_dispatch:
+    types: [train-tagged]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.event.action == 'train-tagged'
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.client_payload.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # the notes need the previous tag and the commits between them
+          fetch-depth: 0
+
+      - name: Generate changelog for this tag
+        run: |
+          set -euo pipefail
+          TAG="$TAG"
+          PREV=$(git tag --sort=-v:refname | grep -A1 "^$TAG$" | tail -1 || true)
+          [ -z "$PREV" ] && PREV=$(git rev-list --max-parents=0 HEAD)
+          {
+            echo "## Changes"
+            git log --format='- %s' "$PREV..$TAG" | sed 's/^feat: */- Add /;s/^fix: */- Fix /;s/^refactor: */- Refactor /' | head -50
+            echo ""
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/$PREV...$TAG"
+          } > notes.md
+          cat notes.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ github.event.repository.name }} ${{ env.TAG }}
+          body_path: notes.md
+          prerelease: true

@@ -40,20 +40,50 @@ jobs:
       - name: Install libsqlite3-dev
         if: matrix.check == 'rust-test'
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
-      # Cross-repository tests need the sibling projects that this one depends
-      # on. They are cloned next to the checkout, exactly like the local layout:
-      # the repository under test stays in $GITHUB_WORKSPACE, the siblings land
-      # in its parent directory, so a relative "../opurom-examples/golden/..." resolves.
+      # Per-repository sibling clones: tests read golden fixtures and sibling
+      # binaries from the local checkout layout, cloned shallow into the parent
+      # directory. Every cloned repository is public, so no token is needed.
       - name: Checkout sibling repositories
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/.."
-          for repo in opurom-examples opurom-lang opurom-core opurom-render opurom-platform opurom-server opurom-db opurom-runtime-adapters opurom-plugins opurom-cli; do
-            url="https://github.com/opurom/${repo}.git"
-            if [ "$repo" != "$(basename "$GITHUB_WORKSPACE")" ] && git ls-remote --exit-code "$url" >/dev/null 2>&1; then
-              git clone --depth 1 "$url" "$repo" || true
-            fi
-          done
-          ls -1
+          case "$(basename "$GITHUB_WORKSPACE")" in
+            opurom-render|opurom-platform|opurom-cli)
+              git clone --depth 1 "https://github.com/opurom/opurom-examples.git" opurom-examples
+              ;;
+            opurom-examples)
+              for repo in opurom-core opurom-lang opurom-render opurom-cli; do
+                git clone --depth 1 "https://github.com/opurom/${repo}.git" "$repo"
+              done
+              ;;
+            *) ;;
+          esac
       - name: Run ${{ matrix.check }}
         run: node .github/scripts/ci-check.mjs ${{ matrix.check }}
+
+  # One ping per push, after every matrix check finished green on main. The
+  # train recomputes its own gate, so this is only a wake-up call, not a
+  # verdict. A ping failure never turns CI red.
+  ci-green:
+    name: notify release train
+    needs: check
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+        needs.check.result == 'success' && github.repository_owner == 'opurom' &&
+        github.event.repository.name != 'opurom-ui' &&
+        github.event.repository.name != 'opurom-icons' &&
+        github.event.repository.name != 'opurom-examples'
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the release train
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TRAIN_TOKEN }}
+        run: |
+          gh api repos/opurom/opurom-release/dispatches \
+            -f event_type=ci-green \
+            -f 'client_payload[repo]=${{ github.event.repository.name }}' \
+            -f 'client_payload[sha]=${{ github.sha }}' \
+            >/dev/null 2>&1 || echo "::warning::release train ping skipped"

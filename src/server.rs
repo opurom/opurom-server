@@ -17,17 +17,22 @@
 //! With none of the mTLS variables set, no client ALPN offer and no `h2`
 //! negotiation, the plain-TLS wire format and response bytes stay identical.
 //!
-//! Connections are bounded by an idle timeout and a maximum number of
-//! in-flight connections.
+//! Connections are admitted through a bounded [`ConnectionPool`]. The pool
+//! uses integer ticks injected from a monotonic source, recycles released
+//! slots in FIFO order and rejects a full pool with a fixed 503 answer.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::pool::Lease;
+pub use crate::pool::{
+    ConnectionPool, PoolError, PoolMetrics, DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_MAX_CONNECTIONS,
+};
 use rustls::server::ServerConnection;
 use rustls::StreamOwned;
 use serde_json::{json, Value};
@@ -56,10 +61,7 @@ pub const KEEP_ALIVE_ENV: &str = "OPR_KEEPALIVE";
 pub const WEBSOCKET_ENV: &str = "OPR_WEBSOCKET";
 
 /// Default idle timeout of a kept-alive connection.
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Default maximum number of connections served at the same time.
-pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS);
 
 /// A running HTTP server.
 pub struct Server {
@@ -75,7 +77,8 @@ pub struct Server {
     websocket: bool,
     idle_timeout: Duration,
     max_connections: usize,
-    in_flight: Arc<AtomicUsize>,
+    pool: Result<ConnectionPool, PoolError>,
+    tick_clock: TickClock,
     /// Shared room membership and per-connection outbound queues.
     rooms: Arc<RoomHub>,
     /// The optional HTTP/3 listener on its own UDP port.
@@ -194,7 +197,8 @@ impl Server {
             websocket: truthy_env(WEBSOCKET_ENV),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             max_connections: DEFAULT_MAX_CONNECTIONS,
-            in_flight: Arc::new(AtomicUsize::new(0)),
+            pool: pool_for_limits(DEFAULT_MAX_CONNECTIONS, DEFAULT_IDLE_TIMEOUT),
+            tick_clock: TickClock::new(),
             rooms,
             http3,
         })
@@ -203,12 +207,14 @@ impl Server {
     /// Set the idle timeout of a kept-alive connection.
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Server {
         self.idle_timeout = timeout;
+        self.pool = pool_for_limits(self.max_connections, self.idle_timeout);
         self
     }
 
     /// Set the maximum number of connections served at the same time.
     pub fn with_max_connections(mut self, limit: usize) -> Server {
         self.max_connections = limit;
+        self.pool = pool_for_limits(self.max_connections, self.idle_timeout);
         self
     }
 
@@ -261,6 +267,11 @@ impl Server {
         self.http3.as_ref()
     }
 
+    /// The connection pool backing the accept loop, or the reason it is invalid.
+    pub fn pool(&self) -> Result<&ConnectionPool, &PoolError> {
+        self.pool.as_ref()
+    }
+
     /// Serve until the shutdown handle is set. One thread per connection.
     pub fn serve(&self) {
         if let Some(http3) = &self.http3 {
@@ -271,6 +282,8 @@ impl Server {
                 shutdown.store(true, Ordering::Relaxed);
             });
         }
+        let configured_pool = self.pool.clone();
+        let tick_clock = self.tick_clock;
         for stream in self.listener.incoming() {
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
@@ -279,6 +292,20 @@ impl Server {
                 Ok(stream) => stream,
                 Err(err) => {
                     eprintln!("[opurom-server] accept failed: {}", err);
+                    continue;
+                }
+            };
+            let pool = match &configured_pool {
+                Ok(pool) => pool.clone(),
+                Err(error) => {
+                    let _ = reject_connection(stream, error);
+                    continue;
+                }
+            };
+            let lease = match pool.admit(tick_clock.now()) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    let _ = reject_connection(stream, &error);
                     continue;
                 }
             };
@@ -293,15 +320,13 @@ impl Server {
             let websocket = self.websocket;
             let rooms = Arc::clone(&self.rooms);
             let shutdown = Arc::clone(&self.shutdown);
-            let in_flight = Arc::clone(&self.in_flight);
-            let current = in_flight.fetch_add(1, Ordering::Relaxed);
-            if current >= self.max_connections {
-                in_flight.fetch_sub(1, Ordering::Relaxed);
-                // The in-flight limit is reached: answer with 503 and close.
-                let _ = reject_connection(stream);
-                continue;
-            }
+            let guard = PoolGuard {
+                pool,
+                lease,
+                clock: tick_clock,
+            };
             thread::spawn(move || {
+                let _guard = guard;
                 let _ = handle_connection(
                     stream,
                     Connection {
@@ -318,7 +343,6 @@ impl Server {
                         shutdown,
                     },
                 );
-                in_flight.fetch_sub(1, Ordering::Relaxed);
             });
         }
     }
@@ -344,10 +368,54 @@ fn truthy_env(name: &str) -> bool {
     })
 }
 
-/// Answer a connection that arrives while the in-flight limit is reached.
-fn reject_connection(mut stream: TcpStream) -> std::io::Result<()> {
-    let response = Response::error(503, "server_busy");
+/// Answer a connection that the pool cannot admit with a fixed overload.
+fn reject_connection(mut stream: TcpStream, error: &PoolError) -> std::io::Result<()> {
+    let mut response = Response::error(503, "server_busy");
+    response.set_header("X-Connection-Pool-Reason", error.code());
     write_response(&mut stream, &response)
+}
+
+/// A monotonic integer tick source. `Instant` is not a wall clock; the pool
+/// itself sees only the `u64` values this produces.
+#[derive(Clone, Copy)]
+struct TickClock {
+    origin: Instant,
+}
+
+impl TickClock {
+    fn new() -> TickClock {
+        TickClock {
+            origin: Instant::now(),
+        }
+    }
+
+    fn now(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+/// Release a pool slot when the connection thread finishes, even on unwind.
+struct PoolGuard {
+    pool: ConnectionPool,
+    lease: Lease,
+    clock: TickClock,
+}
+
+impl Drop for PoolGuard {
+    fn drop(&mut self) {
+        let _ = self.pool.release(self.lease, self.clock.now());
+    }
+}
+
+fn pool_for_limits(
+    max_connections: usize,
+    idle_timeout: Duration,
+) -> Result<ConnectionPool, PoolError> {
+    ConnectionPool::new(max_connections, duration_ticks(idle_timeout))
+}
+
+fn duration_ticks(timeout: Duration) -> u64 {
+    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// One connection transport: plain TCP or TLS.
