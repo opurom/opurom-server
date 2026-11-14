@@ -8,6 +8,7 @@
 //! * [`http3`] - real HTTP/3 over QUIC on a separate UDP listener.
 //! * [`router`] - literal and `:param` routing with per-route fault isolation.
 //! * [`middleware`] - middleware, rate limiting, logs and opt-in HTTP features.
+//! * [`query`] - strict list query parsing, stable ordering and the list envelope.
 //! * [`server`] - a thread-per-connection `TcpListener` server with optional
 //!   TLS, ALPN-selected HTTP/2 and HTTP/1.1 keep-alive.
 //! * [`tls`] - the optional TLS listener with a self-signed fallback, opt-in
@@ -27,6 +28,7 @@ pub mod http2;
 pub mod http3;
 pub mod ir;
 pub mod middleware;
+pub mod query;
 pub mod router;
 pub mod server;
 pub mod ssr;
@@ -46,10 +48,11 @@ pub use http3::{
 pub use middleware::{
     alt_svc_header_value, alt_svc_port_from_env, constant_time_eq, cors_origin_from_env_value,
     etag_for, rate_limit, rate_limit_from_env, rate_limited_response, request_log_line,
-    structured_logging_enabled, tls_request_log_line, HttpOptions, MiddlewareChain, RateLimiter,
-    ALT_SVC_ENV, AUTH_TOKEN_ENV, CORS_ENV, ETAG_ENV, GZIP_THRESHOLD_BYTES, RATE_LIMIT_ENV,
-    RATE_LIMIT_WINDOW_SECS, STRUCTURED_LOG_ENV,
+    structured_logging_enabled, tls_request_log_line, unauthorized_response, AuthOptions,
+    HttpOptions, MiddlewareChain, RateLimiter, ALT_SVC_ENV, AUTH_TOKEN_ENV, CORS_ENV, ETAG_ENV,
+    GZIP_THRESHOLD_BYTES, HEALTH_PATH, RATE_LIMIT_ENV, RATE_LIMIT_WINDOW_SECS, STRUCTURED_LOG_ENV,
 };
+pub use query::{ListQuery, QueryError, DEFAULT_LIMIT, MAX_LIMIT, MAX_OFFSET};
 pub use router::{RegisteredRoute, Router};
 pub use server::{
     Server, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, KEEP_ALIVE_ENV, TLS_ENV, WEBSOCKET_ENV,

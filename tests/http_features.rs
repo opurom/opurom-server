@@ -242,8 +242,15 @@ fn gunzip(body: &[u8]) -> Vec<u8> {
     decoded
 }
 
-fn expected_todo_list(title: &str) -> String {
+fn expected_todo_items(title: &str) -> String {
     format!("[{{\"id\":1,\"title\":\"{}\"}}]", title)
+}
+
+fn expected_todo_list(title: &str) -> String {
+    format!(
+        "{{\"count\":1,\"items\":{},\"limit\":50,\"offset\":0,\"total\":1}}",
+        expected_todo_items(title)
+    )
 }
 
 fn title_for_body_len(target: usize) -> String {
@@ -263,13 +270,13 @@ fn post_todo(port: u16, title: &str, headers: &[(&str, &str)]) -> Answer {
     answer
 }
 
-fn json_statuses(lines: &[String]) -> Vec<u64> {
+fn json_statuses(lines: &[String], path: &str) -> Vec<u64> {
     let mut statuses: Vec<u64> = lines
         .iter()
         .map(|line| {
             let value: Json = serde_json::from_str(line).expect("valid JSON log line");
             assert_eq!(value["method"], "GET");
-            assert_eq!(value["path"], "/health");
+            assert_eq!(value["path"], path);
             assert!(value["elapsed_ms"].is_u64(), "{}", line);
             value["status"].as_u64().expect("numeric status")
         })
@@ -328,7 +335,12 @@ fn cors_origin_validation_rejects_unsafe_values() {
 #[test]
 fn bearer_auth_rejects_missing_and_wrong_tokens() {
     let server = DemoServer::spawn("auth", &[("OPR_AUTH_TOKEN", "devtoken")]);
-    let missing = Answer::parse(&raw_request(server.port, "GET", "/health", &[], b""));
+    // The health route stays open so a probe needs no credential.
+    let open_health = Answer::parse(&raw_request(server.port, "GET", "/health", &[], b""));
+    assert_eq!(open_health.status_line, "HTTP/1.1 200 OK");
+    assert_eq!(open_health.body_str(), HEALTH_BODY);
+
+    let missing = Answer::parse(&raw_request(server.port, "GET", "/todos", &[], b""));
     assert_eq!(missing.status_line, "HTTP/1.1 401 Unauthorized");
     assert_eq!(missing.status(), 401);
     assert_eq!(missing.body_str(), "{\"error\":\"unauthorized\"}");
@@ -338,7 +350,7 @@ fn bearer_auth_rejects_missing_and_wrong_tokens() {
     let wrong = Answer::parse(&raw_request(
         server.port,
         "GET",
-        "/health",
+        "/todos",
         &[("Authorization", "Bearer wrong-token")],
         b"",
     ));
@@ -348,12 +360,15 @@ fn bearer_auth_rejects_missing_and_wrong_tokens() {
     let valid = Answer::parse(&raw_request(
         server.port,
         "GET",
-        "/health",
+        "/todos",
         &[("Authorization", "Bearer devtoken")],
         b"",
     ));
     assert_eq!(valid.status(), 200);
-    assert_eq!(valid.body_str(), HEALTH_BODY);
+    assert_eq!(
+        valid.body_str(),
+        "{\"count\":0,\"items\":[],\"limit\":50,\"offset\":0,\"total\":0}"
+    );
     let etag = valid.header("ETag").expect("the auth env enables ETag");
     assert_eq!(etag, etag_for(&valid.body).as_str());
     assert_eq!(valid.header_count("ETag"), 1);
@@ -361,7 +376,7 @@ fn bearer_auth_rejects_missing_and_wrong_tokens() {
     let lowercase_scheme = Answer::parse(&raw_request(
         server.port,
         "GET",
-        "/health",
+        "/todos",
         &[("Authorization", "bearer devtoken")],
         b"",
     ));
@@ -370,7 +385,7 @@ fn bearer_auth_rejects_missing_and_wrong_tokens() {
     let conditional = Answer::parse(&raw_request(
         server.port,
         "GET",
-        "/health",
+        "/todos",
         &[
             ("Authorization", "Bearer devtoken"),
             ("If-None-Match", etag),
@@ -395,7 +410,7 @@ fn unauthorized_request_counts_against_rate_limit_and_is_logged() {
     let first = Answer::parse(&raw_request(
         server.port,
         "GET",
-        "/health",
+        "/todos",
         &[("Origin", "https://evil.example")],
         b"",
     ));
@@ -412,7 +427,7 @@ fn unauthorized_request_counts_against_rate_limit_and_is_logged() {
     let second = Answer::parse(&raw_request(
         server.port,
         "GET",
-        "/health",
+        "/todos",
         &[
             ("Authorization", "Bearer devtoken"),
             ("Origin", "https://evil.example"),
@@ -429,7 +444,7 @@ fn unauthorized_request_counts_against_rate_limit_and_is_logged() {
 
     let lines = server.wait_for_json_lines(2);
     assert_eq!(lines.len(), 2, "{:?}", lines);
-    assert_eq!(json_statuses(&lines), vec![401, 429]);
+    assert_eq!(json_statuses(&lines, "/todos"), vec![401, 429]);
     assert!(
         !server.stderr().contains("[opurom-server] ->"),
         "{}",

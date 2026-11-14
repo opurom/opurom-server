@@ -11,8 +11,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use flate2::{write::GzEncoder, Compression};
+use sha2::{Digest, Sha256};
 
 use crate::http::{Method, Request, Response, MAX_BODY_BYTES};
+
+/// The one route that answers without a bearer token so a health probe works
+/// unauthenticated.
+pub const HEALTH_PATH: &str = "/health";
 
 /// Environment variable that enables structured JSON request logs.
 pub const STRUCTURED_LOG_ENV: &str = "OPR_LOG_JSON";
@@ -244,7 +249,8 @@ pub fn rate_limit_from_env() -> Option<Middleware> {
 /// HTTP options captured once when a `Server` binds.
 #[derive(Clone, Debug, Default)]
 pub struct HttpOptions {
-    pub auth_token: Option<String>,
+    /// The env-independent bearer-token gate.
+    pub auth: AuthOptions,
     pub cors_origin: Option<String>,
     pub etag: bool,
     /// The UDP port of the HTTP/3 endpoint, advertised with `Alt-Svc`.
@@ -263,18 +269,16 @@ impl HttpOptions {
     /// Read the HTTP options from the environment. Any opt-in variable enables
     /// ETags; `OPR_ETAG` can also enable or explicitly disable them alone.
     pub fn from_env() -> HttpOptions {
-        let auth_token = std::env::var(AUTH_TOKEN_ENV)
-            .ok()
-            .filter(|token| !token.is_empty());
+        let auth = AuthOptions::from_env();
         let cors_origin = std::env::var(CORS_ENV)
             .ok()
             .and_then(|raw| cors_origin_from_env_value(&raw));
         let etag = match std::env::var(ETAG_ENV) {
             Ok(raw) => truthy(&raw),
-            Err(_) => auth_token.is_some() || cors_origin.is_some(),
+            Err(_) => auth.is_enabled() || cors_origin.is_some(),
         };
         HttpOptions {
-            auth_token,
+            auth,
             cors_origin,
             etag,
             alt_svc_port: alt_svc_port_from_env(),
@@ -295,27 +299,84 @@ pub fn alt_svc_port_from_env() -> Option<u16> {
         .and_then(|raw| raw.parse().ok())
 }
 
-/// Compare bytes without an early exit on the first differing byte.
-// shortcut: length remains visible in timing; a production identity provider
-// compares digests instead.
+/// Compare two byte strings in time that depends only on their lengths.
+///
+/// Both inputs are compressed to fixed-width SHA-256 digests and the digests
+/// are XOR-accumulated without an early exit, so the comparison never leaks how
+/// many leading bytes match. The lengths are folded into the verdict before the
+/// digest comparison, which keeps unequal-length tokens rejected.
 pub fn constant_time_eq(expected: &[u8], provided: &[u8]) -> bool {
-    let mut difference = expected.len() ^ provided.len();
-    for index in 0..expected.len().max(provided.len()) {
-        let left = expected.get(index).copied().unwrap_or(0);
-        let right = provided.get(index).copied().unwrap_or(0);
-        difference |= usize::from(left ^ right);
+    let length_mismatch = usize::from(expected.len() ^ provided.len());
+    let left = Sha256::digest(expected);
+    let right = Sha256::digest(provided);
+    let mut difference = length_mismatch;
+    for (a, b) in left.iter().zip(right.iter()) {
+        difference |= usize::from(a ^ b);
     }
     difference == 0
+}
+
+/// Options for the bearer-token gate, supplied by the caller instead of the
+/// process environment so one binary can host several differently configured
+/// servers.
+#[derive(Clone, Debug, Default)]
+pub struct AuthOptions {
+    /// The required bearer token; `None` leaves authentication disabled.
+    pub token: Option<String>,
+    /// Allow unauthenticated requests to [`HEALTH_PATH`] so health probes and
+    /// load balancers can reach the service without a credential.
+    pub allow_health: bool,
+}
+
+impl AuthOptions {
+    /// Require `token` on every non-health route.
+    pub fn new(token: &str) -> AuthOptions {
+        AuthOptions {
+            token: Some(token.to_string()),
+            allow_health: true,
+        }
+    }
+
+    /// Build the options from `OPR_AUTH_TOKEN`, enabling authentication only
+    /// when the variable holds a non-empty value.
+    pub fn from_env() -> AuthOptions {
+        AuthOptions {
+            token: std::env::var(AUTH_TOKEN_ENV)
+                .ok()
+                .filter(|token| !token.is_empty()),
+            allow_health: true,
+        }
+    }
+
+    /// True when authentication is configured.
+    pub fn is_enabled(&self) -> bool {
+        self.token.is_some()
+    }
+
+    /// True when the request may skip the token check: authentication is
+    /// disabled, or the request targets the open health route.
+    pub fn exempt(&self, request: &Request) -> bool {
+        !self.is_enabled()
+            || (self.allow_health && request.method == Method::Get && request.path == HEALTH_PATH)
+    }
+
+    /// True when the request carries a matching `Authorization: Bearer` value.
+    pub fn authorized(&self, request: &Request) -> bool {
+        let Some(token) = self.token.as_deref() else {
+            return true;
+        };
+        request
+            .header("Authorization")
+            .and_then(|raw| raw.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+            .is_some_and(|(_, candidate)| constant_time_eq(candidate.as_bytes(), token.as_bytes()))
+    }
 }
 
 /// Check the development bearer token. This is not a production identity
 /// system: there are no users, scopes, expiry, hashing or credential storage.
 pub fn authorized(request: &Request, token: &str) -> bool {
-    request
-        .header("Authorization")
-        .and_then(|raw| raw.split_once(' '))
-        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
-        .is_some_and(|(_, candidate)| constant_time_eq(candidate.as_bytes(), token.as_bytes()))
+    AuthOptions::new(token).authorized(request)
 }
 
 /// Canonical 401 response for a missing or mismatched bearer token.

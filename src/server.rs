@@ -36,9 +36,9 @@ use tokio_rustls::TlsAcceptor;
 use crate::http::{read_request, status_text, Method, Request, Response, MAX_BODY_BYTES};
 use crate::http2::{self, State as H2State};
 use crate::middleware::{
-    apply_response_features, authorized, cors_preflight, rate_limited_response, request_log_line,
-    structured_logging_enabled, tls_request_log_line, unauthorized_response, HttpOptions,
-    MiddlewareChain, RateLimiter,
+    apply_response_features, cors_preflight, rate_limited_response, request_log_line,
+    structured_logging_enabled, tls_request_log_line, unauthorized_response, AuthOptions,
+    HttpOptions, MiddlewareChain, RateLimiter,
 };
 use crate::router::Router;
 use crate::tls::{self, TlsConfig};
@@ -215,6 +215,13 @@ impl Server {
     /// Enable HTTP/1.1 keep-alive on this server.
     pub fn with_keep_alive(mut self) -> Server {
         self.keep_alive = true;
+        self
+    }
+
+    /// Require a bearer token on every non-health request, from an
+    /// env-independent [`AuthOptions`] value instead of `OPR_AUTH_TOKEN`.
+    pub fn with_auth(mut self, auth: AuthOptions) -> Server {
+        Arc::make_mut(&mut self.options).auth = auth;
         self
     }
 
@@ -585,11 +592,7 @@ pub(crate) fn dispatch_request(
             None => {
                 if let Some(preflight) = cors_preflight(request, options.cors_origin.as_deref()) {
                     preflight
-                } else if options
-                    .auth_token
-                    .as_deref()
-                    .is_some_and(|token| !authorized(request, token))
-                {
+                } else if !options.auth.exempt(request) && !options.auth.authorized(request) {
                     unauthorized_response()
                 } else {
                     router.handle(request)

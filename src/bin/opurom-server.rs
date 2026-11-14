@@ -6,6 +6,8 @@
 //!
 //! The demo serves `/health`, `/ssr` and an in-memory `/todos` collection with
 //! the five CRUD verbs, so the runtime can be exercised without a database.
+//! `GET /todos` takes the structured list query (`limit`, `offset`, `sort`,
+//! `order`, `q`) and answers the paginated envelope.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use opurom_server::http::{Method, Request, Response};
 use opurom_server::middleware::{body_cap, logging, MiddlewareChain};
+use opurom_server::query::ListQuery;
 use opurom_server::router::Router;
 use opurom_server::server::Server;
 use opurom_server::ssr::ssr_html;
@@ -87,13 +90,17 @@ fn demo_router() -> Router {
     });
 
     let list_store = Arc::clone(&todos);
-    router.route(Method::Get, "/todos", move |_request: &mut Request| {
+    router.route(Method::Get, "/todos", move |request: &mut Request| {
+        let query = match ListQuery::parse(&request.query) {
+            Ok(query) => query,
+            Err(err) => return err.response(),
+        };
         let guard = match list_store.lock() {
             Ok(guard) => guard,
             Err(_) => return Response::error(503, "store_locked"),
         };
-        let items: Vec<String> = guard.values().map(json_to_string).collect();
-        Response::json_text(200, &format!("[{}]", items.join(",")))
+        let rows: Vec<serde_json::Value> = guard.values().cloned().collect();
+        Response::json(200, &query.apply(rows))
     });
 
     let create_store = Arc::clone(&todos);

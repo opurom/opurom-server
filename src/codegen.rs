@@ -198,6 +198,7 @@ fn main_rs(ir: &Ir) -> String {
          use opurom_db::{Database, PooledDb, Row, Sqlite, Value as DbValue};\n\
          use opurom_server::http::{Method, Request, Response};\n\
          use opurom_server::middleware::{body_cap, logging, MiddlewareChain};\n\
+         use opurom_server::query::ListQuery;\n\
          use opurom_server::router::Router;\n\
          use opurom_server::server::Server;\n\
          use opurom_server::ssr::ssr_html;\n\
@@ -452,10 +453,20 @@ fn main() {
 
 /// Handler templates, one per CRUD verb.
 const LIST_HANDLER: &str = r#"    let list_db = db.clone();
-    router.route(Method::Get, "{{PATH}}", move |_request: &mut Request| {
+    router.route(Method::Get, "{{PATH}}", move |request: &mut Request| {
+        let query = match ListQuery::parse(&request.query) {
+            Ok(query) => query,
+            Err(err) => return err.response(),
+        };
         list_db.with(|guard| {
         match guard.query("{{SQL}}") {
-            Ok(rows) => Response::json_text(200, &rows_to_json({{MODEL}}, &rows)),
+            Ok(rows) => {
+                let items: Vec<Json> = rows
+                    .iter()
+                    .map(|row| serde_json::from_str(&row_to_json({{MODEL}}, row)).unwrap_or(Json::Null))
+                    .collect();
+                Response::json(200, &query.apply(items))
+            }
             Err(err) => Response::error(500, &format!("database_error: {}", err)),
         }
         })
@@ -888,7 +899,7 @@ fn readme(ir: &Ir) -> String {
     out.push_str("* `OPR_DB` - SQLite database path (default `./opurom.db`)\n");
     out.push_str("* `OPR_RATE_LIMIT` - optional positive integer requests per method and path per 60-second window; excess requests get `429` JSON and `Retry-After` seconds\n");
     out.push_str("* `OPR_LOG_JSON=1` - one JSON line per request to stderr with `method`, `path`, `status` and measured `elapsed_ms`; TLS connections that negotiated ALPN also report `alpn`\n");
-    out.push_str("* `OPR_AUTH_TOKEN` - optional development bearer token; missing or mismatched tokens get `401 {\"error\":\"unauthorized\"}`\n");
+    out.push_str("* `OPR_AUTH_TOKEN` - optional development bearer token; missing or mismatched tokens get `401 {\"error\":\"unauthorized\"}`; `GET /health` stays open\n");
     out.push_str("* `OPR_CORS` - one fixed `http://` or `https://` origin (or the literal `*`); adds CORS headers and answers `OPTIONS` preflight with `204`\n");
     out.push_str("* `OPR_ETAG=1` - enables ETags alone; any other opt-in HTTP variable also enables them. `If-None-Match` on GET can answer `304` with no body\n");
     out.push_str("* `Accept-Encoding: gzip` - request-opt-in gzip for response bodies larger than 1024 bytes; small bodies stay unchanged\n");
@@ -902,6 +913,7 @@ fn readme(ir: &Ir) -> String {
     out.push_str("* `OPR_OCSP_FILE` - required static local DER BasicOCSPResponse, active only with `OPR_MTLS=1`; good/revoked/unknown statuses, CA signature and freshness are checked\n");
     out.push_str("* `OPR_HTTP3=1` - serves HTTP/3 over QUIC on a separate UDP listener with TLS 1.3 and ALPN `h3`; `OPR_HTTP3_PORT` chooses the UDP port (default `4433`)\n");
     out.push_str("* `OPR_ALT_SVC_PORT` - the UDP port advertised with `Alt-Svc: h3=\":PORT\"` on the HTTPS responses\n\n");
+    out.push_str("* `GET <list route>?limit=&offset=&sort=&order=&q=` - strict bounds (400 on negative, non-integer or over-cap values), stable ordering and a `{items,total,count,limit,offset}` envelope; default limit 50, maximum 1000\n\n");
     out.push_str("The service opens one `PooledDb` at startup and shares its Mutex-serialized SQLite connection across all handlers. With no optional hardening env vars and no gzip request header, HTTP responses and stdout stay byte-identical. The rate-limit and log variables never enable the opt-in HTTP response features.\n\n");
     out.push_str("The schema is created at startup from the embedded `migrations/*.sql`.\n\n");
     out.push_str("## Routes\n\n");
