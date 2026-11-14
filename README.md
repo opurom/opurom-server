@@ -38,8 +38,10 @@ TCP/HTTP request -> HTTP/1.1 parser, HTTP/2 mapping or HTTP/3 mapping
                   429 JSON + Retry-After; every parsed request counts
                -> opt-in preflight / bearer auth
                    OPR_CORS OPTIONS -> 204; OPR_AUTH_TOKEN mismatch -> 401
+                   GET /health stays open to an unauthenticated probe
                 -> router::Router
                   literal + :param segments
+                  list routes: ?limit=&offset=&sort=&order=&q= -> 400 or envelope
                   404 unknown / 405 wrong method
                   catch_unwind per handler
                   3 consecutive panics -> route disabled
@@ -74,6 +76,7 @@ accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
 | `http3` | HTTP/3 over QUIC on a separate UDP listener: the TLS 1.3 and ALPN `h3` endpoint, the real h3 request/response exchange and mapping into the shared request pipeline |
 | `middleware` | `MiddlewareChain`, `RateLimiter`, logging helpers, body cap, opt-in HTTP options |
 | `router` | route table, `:param` matching, panic isolation, 3-strike breaker, route introspection |
+| `query` | strict list query parsing (`limit`, `offset`, `sort`, `order`, `q`), stable ordering and the `{items,total,count,limit,offset}` envelope |
 | `server` | `TcpListener` accept loop, one thread per connection, optional TLS, ALPN-selected HTTP/2, optional keep-alive, optional WebSocket upgrade, opt-in response features and measured JSON log |
 | `tls` | the optional TLS listener: environment configuration, PEM loading, self-signed fallback, SHA-256 fingerprint, opt-in client-certificate mTLS, static fingerprint deny list, local DER CRL/OCSP status sources, HTTP CRL distribution point configuration and ALPN |
 | `cert_status` | bounded DER CRL/BasicOCSPResponse parsing, CA signature checks, serial matching, freshness checks, std-only HTTP CRL retrieval with a URL-keyed cache and fail-closed status decisions |
@@ -136,8 +139,9 @@ tooling can enumerate verbs and paths without keeping a second list.
 
 | Situation | Status | Body |
 | --- | --- | --- |
-| Health check | 200 | `{"ok":true,"app":"<name>","version":"0.2.0"}` |
-| List | 200 | bare JSON array of row objects |
+| Health check | 200 | `{"ok":true,"app":"<name>","version":"0.2.0"}` (open even with auth) |
+| List | 200 | `{"items":[...],"total":N,"count":N,"limit":N,"offset":N}` |
+| Invalid list query value | 400 | `{"error":"invalid_limit"}` and variants (`negative_*`, `*_too_large`, `invalid_order`) |
 | Create | 201 | the created row object |
 | Get / Update | 200 | the row object |
 | Delete | 200 | `{"deleted":true}` |
@@ -223,16 +227,56 @@ byte-identical to the defaults.
 
 `OPR_AUTH_TOKEN=<value>` requires `Authorization: Bearer <value>` on every
 non-preflight request. Missing, malformed or mismatched credentials get
-`401` with `{"error":"unauthorized"}`. The token bytes are compared without
-an early-exit equality loop; length remains visible in timing. **This is a
-development token, not a production identity system**: there are no users,
-scopes, expiry, password hashing or credential storage.
+`401` with `{"error":"unauthorized"}`. `GET /health` stays open so a health
+probe or load balancer reaches the service with no credential. The token bytes
+are compared in time that depends only on their lengths: both sides are folded
+to SHA-256 digests and XOR-accumulated without an early exit, so a wrong token
+never reveals how many leading bytes matched. **This is a development token,
+not a production identity system**: there are no users, scopes, expiry,
+password hashing or credential storage.
+
+The gate is configured by an env-independent `AuthOptions` value
+(`AuthOptions::new(token)`, `allow_health` on by default) through
+`Server::with_auth(options)`; `OPR_AUTH_TOKEN` is only one way to fill it. A
+server built with `AuthOptions::default()` leaves every route open.
 
 ```sh
-curl -i http://127.0.0.1:8787/health
+curl -i http://127.0.0.1:8787/health        # open: 200, no credential
+curl -i http://127.0.0.1:8787/todos         # 401
 # HTTP/1.1 401 Unauthorized ... {"error":"unauthorized"}
-curl -i -H 'Authorization: Bearer devtoken' http://127.0.0.1:8787/health
+curl -i -H 'Authorization: Bearer devtoken' http://127.0.0.1:8787/todos
 ```
+
+### List query and pagination
+
+The list routes (`GET /todos` in the demo, `list` in generated services) accept
+a structured query and answer a paginated envelope:
+
+```
+GET /todos?limit=20&offset=40&sort=title&order=desc&q=write
+{
+  "items":  [ {"id": 7, "title": "write tests"}, ... ],
+  "total":  5,   // rows after the filter, before paging
+  "count":  2,   // rows in this page (items length)
+  "limit":  20,
+  "offset": 40
+}
+```
+
+* `limit` - page size, default 50 (`query::DEFAULT_LIMIT`), `1..=1000`
+  (`query::MAX_LIMIT`). `limit=0` is accepted and returns an empty page.
+* `offset` - rows to skip, default 0, `0..=1_000_000` (`query::MAX_OFFSET`).
+* `sort` - the field name to order by; absent means the handler's own order.
+* `order` - `asc` (default) or `desc`.
+* `q` - case-insensitive substring filter across a row's scalar fields.
+
+Validation is strict and returns `400` with a specific reason instead of
+silently clamping: a negative (`negative_limit`), non-integer
+(`invalid_limit`), or over-cap (`limit_too_large`) value, an unknown `order`
+(`invalid_order`) and the same for `offset`. Unknown parameters are ignored so a
+link with `?utm=...` still lists. Ordering is deterministic and stable: equal
+keys keep their incoming order, integers compare exactly, strings by bytes, and
+a missing key sorts last, so repeated calls return identical bytes.
 
 ### gzip responses
 
@@ -292,9 +336,10 @@ curl -i -X OPTIONS -H 'Origin: https://app.example' \
 ### Composition
 
 Order is: middleware/logging -> rate limit -> CORS preflight -> bearer
-auth -> router/pooled handlers -> CORS/ETag/gzip finalization -> one log line.
-An unauthorized request still counts against `OPR_RATE_LIMIT` and gets an
-`OPR_LOG_JSON` line; a preflight does the same. Gzip, ETag and fixed CORS
+auth -> router/pooled handlers (list routes parse the structured query here)
+-> CORS/ETag/gzip finalization -> one log line. An unauthorized request still
+counts against `OPR_RATE_LIMIT` and gets an `OPR_LOG_JSON` line; a preflight
+does the same, and an open `/health` request does too. Gzip, ETag and fixed CORS
 headers compose on one response, and `304` keeps CORS headers but has no
 compressed body. The generated service's one shared `PooledDb` is unchanged.
 
@@ -840,14 +885,15 @@ cargo fmt --all
 cargo test
 ```
 
-`cargo test` runs 129 tests: the base HTTP, request-contract, SSR, hardening, codegen and
-router-introspection suites plus the opt-in HTTP, TLS, WebSocket, keep-alive,
-mutual-TLS, HTTP/2, HTTP/3 and certificate-status suites. Several suites
-drive a real server on an ephemeral port over TCP:
+`cargo test` runs 141 tests: the base HTTP, request-contract, SSR, hardening, codegen,
+router-introspection and list-query/auth suites plus the opt-in HTTP, TLS,
+WebSocket, keep-alive, mutual-TLS, HTTP/2, HTTP/3 and certificate-status suites.
+Several suites drive a real server on an ephemeral port over TCP:
 
 | Test file | Covers |
 | --- | --- |
 | `tests/http_server.rs` | health, the full CRUD lifecycle, 404, 405, 413, the 1 MiB boundary, panic -> 500 -> 503 with other routes still serving, `:param` matching |
+| `tests/list_query_auth.rs` | real loopback TCP for bearer auth (authenticated vs unauthenticated, wrong token, missing token) and the list query: malformed/negative/over-cap 400s, boundary values, the `total/count/limit/offset` envelope, stable ordering across repeated calls, and other routes still serving after a rejected request |
 | `tests/router_introspection.rs` | the route-table query: an empty table, methods and patterns in registration order, canonical pattern normalization and a read-only query that leaves dispatch unchanged |
 | `tests/request_bounds.rs` | loopback TCP checks for the 1 MiB body cap (413), the 64 KiB header block cap (431), an unterminated oversized header line stopped by the same cap, a stalled request timing out with 408 while another connection still gets 200, pipelined requests answered in order, the `Expect: 100-continue` interim answer with the body after it, 417 for an unknown expectation, a 413 behind `Expect` without a drain wait and the documented limit constants |
 | `tests/ssr.rs` | byte-identical output for the same IR and theme, theme changes the output, state interpolation, kind -> HTML element mapping, IR version validation |
@@ -885,7 +931,8 @@ Implemented and verified in this repository:
 | Middleware chain | Implemented (plain logging by default, body cap) |
 | Fixed-window rate limiting | Implemented, opt-in via `OPR_RATE_LIMIT`, process-local |
 | Structured request logging | Implemented, opt-in via `OPR_LOG_JSON`, measured `elapsed_ms`, plus `alpn` when TLS negotiated a protocol |
-| Bearer auth (development token) | Implemented, opt-in via `OPR_AUTH_TOKEN`, 401 JSON, no early-exit byte comparison |
+| Bearer auth (development token) | Implemented, opt-in via `OPR_AUTH_TOKEN` or an env-independent `AuthOptions` + `Server::with_auth`, 401 JSON, SHA-256 constant-time comparison, open `/health` |
+| List query and pagination | Implemented, `?limit=&offset=&sort=&order=&q=` with strict 400s, stable ordering and a `{items,total,count,limit,offset}` envelope on demo and generated list routes |
 | gzip responses | Implemented, request-opt-in above 1024 bytes, `Content-Encoding` and `Vary`, decompression tested |
 | ETag / `304` | Implemented, opt-in deterministic body hash, empty-body conditional response over TCP |
 | CORS / preflight | Implemented, opt-in fixed origin or literal `*`, 204 with fixed allow lists |
@@ -911,7 +958,7 @@ Out of scope for this repository:
 | HSM and private-key isolation | the private key is loaded from PEM or generated in memory |
 | `permessage-deflate` | no extension is negotiated, no frame is compressed |
 | Load-balancer integration | no `X-Forwarded-*`, no `Forwarded`, no proxy protocol |
-| Authentication provider / token lifecycle | the development bearer token only |
+| Authentication provider / token lifecycle | one development bearer token only; no users, scopes, expiry, hashing or rotation |
 | Connection pool sizing | one shared Mutex-guarded connection, one thread per TCP connection |
 | Distributed rate limiting | in-process counters only |
 | PostgreSQL / MySQL drivers | SQLite and the `opurom-db` KV/Memory drivers only |
