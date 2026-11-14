@@ -4,7 +4,7 @@ OPUROM backend runtime: a small HTTP/1.1 server with ALPN-selected HTTP/2 and
 opt-in HTTP/3 over QUIC, a router with path parameters, per-route fault
 isolation, a deterministic SSR host, hardening (pooled SQLite, fixed-window
 rate limiting, structured logs), opt-in HTTP features (bearer auth, gzip,
-ETag, CORS), opt-in transport features (TLS, WebSocket, HTTP/1.1 keep-alive),
+ETag, CORS), opt-in transport features (TLS, WebSocket room broadcasts, HTTP/1.1 keep-alive),
 opt-in mutual TLS with a static certificate revocation deny list and ALPN
 reporting, opt-in DER CRL/OCSP certificate status checks from local files or
 an HTTP CRL distribution point with a refreshable cache, and
@@ -77,9 +77,10 @@ accept -> optional TLS handshake (rustls, OPR_TLS=1 or OPR_MTLS=1)
 | `middleware` | `MiddlewareChain`, `RateLimiter`, logging helpers, body cap, opt-in HTTP options |
 | `router` | route table, `:param` matching, panic isolation, 3-strike breaker, route introspection |
 | `query` | strict list query parsing (`limit`, `offset`, `sort`, `order`, `q`), stable ordering and the `{items,total,count,limit,offset}` envelope |
-| `server` | `TcpListener` accept loop, one thread per connection, optional TLS, ALPN-selected HTTP/2, optional keep-alive, optional WebSocket upgrade, opt-in response features and measured JSON log |
+| `server` | `TcpListener` accept loop, one thread per connection, optional TLS, ALPN-selected HTTP/2, optional keep-alive, optional WebSocket upgrade with ordered room queues, opt-in response features and measured JSON log |
 | `tls` | the optional TLS listener: environment configuration, PEM loading, self-signed fallback, SHA-256 fingerprint, opt-in client-certificate mTLS, static fingerprint deny list, local DER CRL/OCSP status sources, HTTP CRL distribution point configuration and ALPN |
 | `cert_status` | bounded DER CRL/BasicOCSPResponse parsing, CA signature checks, serial matching, freshness checks, std-only HTTP CRL retrieval with a URL-keyed cache and fail-closed status decisions |
+| `rooms` | socket-free bounded room membership, stable first-join ordering, exact broadcast recipients and typed room errors |
 | `websocket` | the RFC 6455 frame codec with size limits, the server channel and the client helper |
 | `ssr` | deterministic HTML rendering of the IR tree with theme tokens |
 | `ir` | IR v0.1 model: state, tree, theme, models, api |
@@ -426,6 +427,37 @@ against those limits before any buffer is allocated, so a hostile peer
 cannot make the server allocate without limit. A control frame payload is
 capped at 125 bytes as RFC 6455 requires. Client frames must be masked and
 server frames are never masked.
+
+#### Room control messages
+
+All upgraded connections on one `Server` share a process-local room hub. One
+outbound queue per connection preserves frame order while the registry keeps
+members in first-join order. Control messages are UTF-8 text frames containing
+one JSON object with a `type` field:
+
+| Client control frame | Server behavior |
+| --- | --- |
+| `{"type":"join","room":"design"}` | joins and answers `{"type":"joined","room":"design"}` |
+| `{"type":"leave","room":"design"}` | leaves and answers `{"type":"left","room":"design"}` |
+| `{"type":"broadcast","room":"design","payload":<JSON>}` | sends `{"type":"broadcast","room":"design","payload":<JSON>}` to every member, including the sender when it is a member, in stable first-join order |
+
+Any connected client may broadcast to a known room. Text without a `type`
+field, other JSON and binary frames keep the existing echo behavior. Unknown
+types and malformed controls answer
+`{"type":"error","error":"<code>","message":"<detail>"}` without closing the
+connection or another client. Codes are `unknown_control_type`,
+`invalid_control`, `invalid_room`, `room_limit`, `member_limit`,
+`room_closed`, `unknown_room` and `payload_too_large`.
+
+Room names are 1-64 ASCII bytes of letters, digits, `.`, `_` or `-`. The caps
+are `rooms::MAX_ROOMS` (32 distinct names, including closed names),
+`rooms::MAX_ROOM_MEMBERS` (32 members per room) and
+`rooms::MAX_ROOM_NAME_BYTES` (64 bytes). A broadcast is one text frame, so an
+envelope larger than `MAX_FRAME_PAYLOAD` gets `payload_too_large`. The
+socket-free `rooms::RoomRegistry` also exposes `close`, which removes all
+members and permanently rejects later joins. Rooms are process-local; the
+HTTP/1.1 upgrade still runs before HTTP middleware/bearer auth, so frame
+access is not gated by `OPR_AUTH_TOKEN`.
 
 ```rust
 use opurom_server::websocket::client::WebSocketClient;
@@ -901,11 +933,12 @@ Several suites drive a real server on an ephemeral port over TCP:
 | `tests/hardening.rs` | deterministic N/N+1 rate-limit boundary and window reset, `OPR_RATE_LIMIT` over TCP, JSON log shape with numeric measured `elapsed_ms`, one JSON stderr line per request, byte-identical default responses |
 | `tests/http_features.rs` | 401/304/204 status and body paths, gzip bytes decompressed to the original JSON, exact 1024-byte threshold, fixed CORS headers/preflight, deterministic ETag over TCP, all-feature composition, unauthorized and preflight rate-limit/log composition, default-off wire bytes |
 | `tests/tls.rs` | a real TLS handshake over a real socket, an untrusted certificate refused by the client, the SHA-256 fingerprint and the private key never logged, a missing certificate file, a certificate without a key naming the missing variable, a corrupt PEM, a mismatched certificate and key pair, the demo server exiting with a clear error, plain HTTP staying byte-identical |
-| `tests/websocket.rs` | the RFC 6455 handshake with the documented accept value, a text frame round trip, a binary frame round trip, ping answered with pong, a close frame with its code and reason, a message reassembled from two fragments, a message reassembled from three fragments, an oversized frame refused before allocation, an unmasked client frame refused, the client refusing a wrong accept value and a non-101 answer |
+| `tests/websocket.rs` | the RFC 6455 handshake with the documented accept value, a text frame round trip, a binary frame round trip, ping answered with pong, a close frame with its code and reason, a message reassembled from two fragments, a message reassembled from three fragments, an oversized frame refused before allocation, an unmasked client frame refused, the client refusing a wrong accept value and a non-101 answer, plus real loopback room broadcasts: three members receive the same payload, a non-member receives nothing, leave stops delivery, malformed controls return error frames while both connections survive, and room/member caps reject only the over-limit join |
 | `tests/keepalive.rs` | two requests on one socket, a `Connection: close` request ending the connection, the idle timeout closing a silent connection, the in-flight limit answering 503, the documented default limits, the demo server with and without `OPR_KEEPALIVE` |
 | `tests/mtls.rs` | real sockets with an rcgen CA -> server chain -> client cert chain, `OPR_MTLS=1` alone enabling TLS, a trusted client accepted, missing and self-signed untrusted clients refused, a revoked-but-trusted cert refused and a non-revoked one accepted, a spoofed fingerprint header ignored, `h2`/`http/1.1` ALPN selection with a real h2 client for `h2`, the structured log `alpn` field, clear mTLS refusal diagnostics, and the byte-identical single-sided TLS answer |
 | `tests/http2.rs` | `h2_concurrent_streams_share_one_tls_connection`, `h2_large_body_flow_control_isolates_failed_stream` and `h2_shutdown_sends_graceful_goaway`: one real h2 client connection with several concurrent streams, exact statuses/bodies and the opt-in response features, 256 KiB response and 128 KiB request across flow-control windows, panic isolation, and raw-frame initial/final GOAWAY with PING/PONG |
 | `src/cert_status.rs` | DER GeneralizedTime, canonical serial, strict DER-length, HTTP URL validation, HTTP status/framing bounds and CRL Distribution Points extension unit tests |
+| `src/rooms.rs` | socket-free room-name validation, stable first-join recipients without duplicates, repeated leave/close semantics, typed unknown/closed errors and both bounded caps |
 | `tests/cert_status.rs` | real mTLS sockets with rcgen CRL/OCSP fixtures: `crl_revoked_serial_is_refused_and_good_client_is_accepted`, `crl_stale_or_tampered_der_fails_closed`, `crl_malformed_or_oversized_der_fails_closed`, `ocsp_good_status_is_accepted_and_revoked_status_is_refused`, `ocsp_unknown_and_wrong_serial_fail_closed`, `ocsp_stale_or_tampered_response_fails_closed`, `ocsp_empty_env_value_fails_closed`, `ocsp_unavailable_or_malformed_file_fails_closed`, both-sources-required and byte-identical default checks |
 | `tests/status_env.rs` | `crl_and_ocsp_env_files_configure_mtls`: `OPR_CRL_FILE`/`OPR_OCSP_FILE` local DER files over a real mTLS socket, with missing sources failing closed |
 | `tests/crl_live.rs` | a loopback HTTP/1.1 distribution point with measured request counts: `live_crl_url_fetches_caches_refreshes_and_fails_closed`, `live_crl_without_cache_and_without_server_fails_closed`, `live_crl_url_keeps_signature_freshness_and_serial_checks`, `crl_file_takes_precedence_over_crl_url`, `crl_url_from_certificate_extension_fetches_and_caches` and `invalid_crl_url_or_ttl_is_a_startup_error` |
@@ -945,7 +978,7 @@ Implemented and verified in this repository:
 | Local certificate status | Implemented, opt-in via `OPR_CRL_FILE` / `OPR_OCSP_FILE`, CA-signature-verified, bounded DER parsing, fail-closed on unavailable/malformed/stale sources |
 | Live CRL retrieval with cache | Implemented, opt-in via `OPR_CRL_URL` (an `http://` URL or the certificate CRL Distribution Points extension), std-only HTTP client with bounded timeouts and response size, URL-keyed cache refreshed by `OPR_CRL_TTL_SECS`, fail-closed with a clear error when no valid copy exists |
 | ALPN negotiation and reporting | Implemented, `h2` and `http/1.1` advertised, selected protocol in the structured log; h2 frames are served when `h2` is selected |
-| WebSocket (RFC 6455) | Implemented, opt-in via `OPR_WEBSOCKET=1`, handshake, text, binary, ping/pong, close and fragmentation, bounded frames |
+| WebSocket (RFC 6455) | Implemented, opt-in via `OPR_WEBSOCKET=1`, handshake, text, binary, ping/pong, close and fragmentation, bounded frames and process-local bounded room broadcasts |
 | HTTP/1.1 keep-alive | Implemented, opt-in via `OPR_KEEPALIVE=1`, `Content-Length` framing, idle timeout, in-flight limit |
 
 Out of scope for this repository:

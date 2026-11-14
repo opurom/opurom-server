@@ -1,5 +1,6 @@
 //! WebSocket tests: the RFC 6455 handshake, text and binary frames,
-//! ping/pong, close frames and fragmentation, all over a real socket.
+//! ping/pong, close frames, fragmentation and room broadcasts, all over a real
+//! socket.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -14,6 +15,8 @@ use opurom_server::server::Server;
 use opurom_server::websocket::{
     accept_key, client::WebSocketClient, encode_frame, Opcode, WsMessage, MAX_FRAME_PAYLOAD,
 };
+use opurom_server::{MAX_ROOMS, MAX_ROOM_MEMBERS};
+use serde_json::{json, Value};
 
 /// Start a WebSocket-capable server on an ephemeral port.
 fn start(router: Router) -> (u16, Arc<std::sync::atomic::AtomicBool>) {
@@ -57,6 +60,63 @@ fn raw_upgrade(port: u16, request: &str) -> String {
         }
     }
     String::from_utf8_lossy(&raw).into_owned()
+}
+
+fn connect(port: u16) -> WebSocketClient {
+    let client = WebSocketClient::connect(&format!("127.0.0.1:{port}"), "/ws")
+        .expect("the handshake succeeds");
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout is set");
+    client
+}
+
+fn send_control(client: &mut WebSocketClient, control: &Value) {
+    client
+        .send_text(&control.to_string())
+        .expect("send control");
+}
+
+fn recv_json(client: &mut WebSocketClient) -> Value {
+    match client.recv().expect("receive JSON frame") {
+        WsMessage::Text(text) => serde_json::from_str(&text).expect("valid JSON"),
+        other => panic!("expected a text message, got {:?}", other),
+    }
+}
+
+fn expect_ack(client: &mut WebSocketClient, kind: &str, room: &str) {
+    let frame = recv_json(client);
+    assert_eq!(frame["type"].as_str(), Some(kind));
+    assert_eq!(frame["room"].as_str(), Some(room));
+}
+
+fn expect_error(client: &mut WebSocketClient, code: &str) -> Value {
+    let frame = recv_json(client);
+    assert_eq!(frame["type"].as_str(), Some("error"));
+    assert_eq!(frame["error"].as_str(), Some(code));
+    assert!(frame["message"]
+        .as_str()
+        .is_some_and(|message| !message.is_empty()));
+    frame
+}
+
+fn expect_broadcast(client: &mut WebSocketClient, room: &str, payload: &Value) {
+    let frame = recv_json(client);
+    assert_eq!(frame["type"].as_str(), Some("broadcast"));
+    assert_eq!(frame["room"].as_str(), Some(room));
+    assert_eq!(&frame["payload"], payload);
+}
+
+fn assert_no_message(client: &mut WebSocketClient) {
+    client
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("short read timeout is set");
+    let outcome = client.recv();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout is restored");
+    let unexpected = outcome.ok();
+    assert!(unexpected.is_none(), "unexpected frame: {:?}", unexpected);
 }
 
 #[test]
@@ -253,4 +313,179 @@ fn the_client_refuses_a_non_101_answer() {
         .expect_err("a non-101 answer must be refused");
     assert!(error.to_string().contains("404"), "{}", error);
     handle.join().expect("the fake server finishes");
+}
+
+#[test]
+fn three_members_receive_the_same_broadcast_payload() {
+    let (port, shutdown) = start(demo_router());
+    let mut clients = [connect(port), connect(port), connect(port)];
+    for client in clients.iter_mut() {
+        send_control(client, &json!({"type":"join","room":"trio"}));
+    }
+    for client in clients.iter_mut() {
+        expect_ack(client, "joined", "trio");
+    }
+    let payload = json!({"seq":7,"text":"all three"});
+    send_control(
+        &mut clients[1],
+        &json!({"type":"broadcast","room":"trio","payload":payload.clone()}),
+    );
+    for client in clients.iter_mut() {
+        expect_broadcast(client, "trio", &payload);
+    }
+    shutdown.store(true, Ordering::Relaxed);
+}
+
+#[test]
+fn a_room_broadcast_excludes_a_non_member() {
+    let (port, shutdown) = start(demo_router());
+    let mut alice = connect(port);
+    let mut bob = connect(port);
+    let mut outsider = connect(port);
+    send_control(&mut alice, &json!({"type":"join","room":"design"}));
+    send_control(&mut bob, &json!({"type":"join","room":"design"}));
+    send_control(&mut outsider, &json!({"type":"join","room":"lobby"}));
+    expect_ack(&mut alice, "joined", "design");
+    expect_ack(&mut bob, "joined", "design");
+    expect_ack(&mut outsider, "joined", "lobby");
+
+    let payload = json!({"seq":1,"text":"ship it"});
+    send_control(
+        &mut alice,
+        &json!({"type":"broadcast","room":"design","payload":payload.clone()}),
+    );
+    expect_broadcast(&mut alice, "design", &payload);
+    expect_broadcast(&mut bob, "design", &payload);
+    assert_no_message(&mut outsider);
+    shutdown.store(true, Ordering::Relaxed);
+}
+
+#[test]
+fn leaving_a_room_stops_delivery_but_keeps_the_connection_alive() {
+    let (port, shutdown) = start(demo_router());
+    let mut alice = connect(port);
+    let mut bob = connect(port);
+    for client in [&mut alice, &mut bob] {
+        send_control(client, &json!({"type":"join","room":"design"}));
+        expect_ack(client, "joined", "design");
+    }
+    send_control(&mut bob, &json!({"type":"leave","room":"design"}));
+    expect_ack(&mut bob, "left", "design");
+
+    let first = json!({"seq":1});
+    send_control(
+        &mut alice,
+        &json!({"type":"broadcast","room":"design","payload":first.clone()}),
+    );
+    expect_broadcast(&mut alice, "design", &first);
+    assert_no_message(&mut bob);
+
+    send_control(&mut bob, &json!({"type":"join","room":"design"}));
+    expect_ack(&mut bob, "joined", "design");
+    let second = json!({"seq":2});
+    send_control(
+        &mut alice,
+        &json!({"type":"broadcast","room":"design","payload":second.clone()}),
+    );
+    expect_broadcast(&mut alice, "design", &second);
+    expect_broadcast(&mut bob, "design", &second);
+    shutdown.store(true, Ordering::Relaxed);
+}
+
+#[test]
+fn malformed_controls_return_errors_and_keep_other_clients_connected() {
+    let (port, shutdown) = start(demo_router());
+    let mut alice = connect(port);
+    let mut bob = connect(port);
+    send_control(&mut bob, &json!({"type":"join","room":"design"}));
+    expect_ack(&mut bob, "joined", "design");
+
+    let cases = [
+        (json!({"type":"frobnicate"}), "unknown_control_type"),
+        (json!({"type":"join"}), "invalid_control"),
+        (json!({"type":"join","room":"bad room"}), "invalid_room"),
+        (
+            json!({"type":"broadcast","room":"design"}),
+            "invalid_control",
+        ),
+        (
+            json!({"type":"broadcast","room":"missing","payload":{"seq":99}}),
+            "unknown_room",
+        ),
+    ];
+    for (control, code) in cases {
+        send_control(&mut alice, &control);
+        let frame = expect_error(&mut alice, code);
+        if code == "unknown_control_type" {
+            assert!(frame["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("frobnicate")));
+        }
+    }
+    assert_no_message(&mut bob);
+
+    send_control(&mut alice, &json!({"type":"join","room":"design"}));
+    expect_ack(&mut alice, "joined", "design");
+    let payload = json!({"seq":42,"text":"survived"});
+    send_control(
+        &mut alice,
+        &json!({"type":"broadcast","room":"design","payload":payload.clone()}),
+    );
+    expect_broadcast(&mut alice, "design", &payload);
+    expect_broadcast(&mut bob, "design", &payload);
+    shutdown.store(true, Ordering::Relaxed);
+}
+
+#[test]
+fn the_room_cap_is_enforced_without_closing_the_connection() {
+    let (port, shutdown) = start(demo_router());
+    let mut client = connect(port);
+    for index in 0..MAX_ROOMS {
+        let room = format!("room-{index}");
+        send_control(&mut client, &json!({"type":"join","room":room.clone()}));
+        expect_ack(&mut client, "joined", &room);
+    }
+    send_control(&mut client, &json!({"type":"join","room":"overflow"}));
+    expect_error(&mut client, "room_limit");
+
+    let payload = json!({"seq":"after-cap"});
+    send_control(
+        &mut client,
+        &json!({"type":"broadcast","room":"room-0","payload":payload.clone()}),
+    );
+    expect_broadcast(&mut client, "room-0", &payload);
+    shutdown.store(true, Ordering::Relaxed);
+}
+
+#[test]
+fn the_member_cap_is_enforced_without_closing_the_connection() {
+    let (port, shutdown) = start(demo_router());
+    let mut clients: Vec<WebSocketClient> = (0..=MAX_ROOM_MEMBERS).map(|_| connect(port)).collect();
+    let (members, extra) = clients.split_at_mut(MAX_ROOM_MEMBERS);
+    for client in members.iter_mut() {
+        send_control(client, &json!({"type":"join","room":"packed"}));
+        expect_ack(client, "joined", "packed");
+    }
+    send_control(&mut extra[0], &json!({"type":"join","room":"packed"}));
+    expect_error(&mut extra[0], "member_limit");
+
+    let payload = json!({"seq":32,"text":"packed"});
+    send_control(
+        &mut members[0],
+        &json!({"type":"broadcast","room":"packed","payload":payload.clone()}),
+    );
+    for client in members.iter_mut() {
+        expect_broadcast(client, "packed", &payload);
+    }
+    assert_no_message(&mut extra[0]);
+
+    send_control(&mut extra[0], &json!({"type":"join","room":"spare"}));
+    expect_ack(&mut extra[0], "joined", "spare");
+    let spare_payload = json!({"seq":33,"text":"spare"});
+    send_control(
+        &mut extra[0],
+        &json!({"type":"broadcast","room":"spare","payload":spare_payload.clone()}),
+    );
+    expect_broadcast(&mut extra[0], "spare", &spare_payload);
+    shutdown.store(true, Ordering::Relaxed);
 }

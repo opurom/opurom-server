@@ -10,6 +10,7 @@
 //! * [`middleware`] - an ordered request/response pipeline (request-id, access
 //!   log, ETag/304, gzip, Cache-Control), rate limiting and opt-in features.
 //! * [`query`] - strict list query parsing, stable ordering and the list envelope.
+//! * [`rooms`] - bounded, deterministic WebSocket room membership and recipients.
 //! * [`server`] - a thread-per-connection `TcpListener` server with optional
 //!   TLS, ALPN-selected HTTP/2 and HTTP/1.1 keep-alive.
 //! * [`tls`] - the optional TLS listener with a self-signed fallback, opt-in
@@ -30,6 +31,7 @@ pub mod http3;
 pub mod ir;
 pub mod middleware;
 pub mod query;
+pub mod rooms;
 pub mod router;
 pub mod server;
 pub mod ssr;
@@ -57,6 +59,9 @@ pub use middleware::{
     RATE_LIMIT_WINDOW_SECS, RESPONSE_STAGES, STRUCTURED_LOG_ENV,
 };
 pub use query::{ListQuery, QueryError, DEFAULT_LIMIT, MAX_LIMIT, MAX_OFFSET};
+pub use rooms::{
+    validate_room_name, RoomError, RoomRegistry, MAX_ROOMS, MAX_ROOM_MEMBERS, MAX_ROOM_NAME_BYTES,
+};
 pub use router::{RegisteredRoute, Router};
 pub use server::{
     Server, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, KEEP_ALIVE_ENV, TLS_ENV, WEBSOCKET_ENV,

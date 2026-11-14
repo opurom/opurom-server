@@ -21,15 +21,16 @@
 //! in-flight connections.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use rustls::server::ServerConnection;
 use rustls::StreamOwned;
+use serde_json::{json, Value};
 use tokio::net::TcpStream as TokioTcpStream;
 use tokio_rustls::TlsAcceptor;
 
@@ -40,6 +41,7 @@ use crate::middleware::{
     structured_logging_enabled, tls_access_log_line, unauthorized_response, valid_request_id,
     AuthOptions, HttpOptions, MiddlewareChain, RateLimiter,
 };
+use crate::rooms::{self, RoomError, RoomRegistry};
 use crate::router::Router;
 use crate::tls::{self, TlsConfig};
 use crate::websocket::{self, ServerChannel, WsChannel};
@@ -74,6 +76,8 @@ pub struct Server {
     idle_timeout: Duration,
     max_connections: usize,
     in_flight: Arc<AtomicUsize>,
+    /// Shared room membership and per-connection outbound queues.
+    rooms: Arc<RoomHub>,
     /// The optional HTTP/3 listener on its own UDP port.
     http3: Option<Arc<crate::http3::Http3Server>>,
 }
@@ -139,6 +143,7 @@ impl Server {
         let router = Arc::new(router);
         let middleware = Arc::new(middleware);
         let limiter = RateLimiter::from_env().map(Arc::new);
+        let rooms = Arc::new(RoomHub::default());
         let mut options = HttpOptions::from_env();
         options.tls = tls_config.is_some();
 
@@ -190,6 +195,7 @@ impl Server {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             in_flight: Arc::new(AtomicUsize::new(0)),
+            rooms,
             http3,
         })
     }
@@ -285,6 +291,7 @@ impl Server {
             let idle_timeout = self.idle_timeout;
             let keep_alive = self.keep_alive;
             let websocket = self.websocket;
+            let rooms = Arc::clone(&self.rooms);
             let shutdown = Arc::clone(&self.shutdown);
             let in_flight = Arc::clone(&self.in_flight);
             let current = in_flight.fetch_add(1, Ordering::Relaxed);
@@ -307,6 +314,7 @@ impl Server {
                         idle_timeout,
                         keep_alive,
                         websocket,
+                        rooms,
                         shutdown,
                     },
                 );
@@ -364,25 +372,71 @@ impl Write for Transport {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Transport::Plain(stream) => stream.write(buf),
-            Transport::Tls(stream) => match stream {
-                Some(stream) => stream.write(buf),
-                None => Ok(0),
-            },
+            Transport::Tls(Some(stream)) => {
+                // Queue plaintext and drain TLS output without calling
+                // complete_io: a socket read timeout must not fail a broadcast.
+                let written = {
+                    let mut writer = stream.conn.writer();
+                    writer.write(buf)?
+                };
+                drain_tls(stream.as_mut())?;
+                Ok(written)
+            }
+            Transport::Tls(None) => Ok(0),
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Transport::Plain(stream) => stream.flush(),
-            Transport::Tls(stream) => match stream {
-                Some(stream) => stream.flush(),
-                None => Ok(()),
-            },
+            Transport::Tls(Some(stream)) => {
+                {
+                    let mut writer = stream.conn.writer();
+                    writer.flush()?;
+                }
+                drain_tls(stream.as_mut())
+            }
+            Transport::Tls(None) => Ok(()),
         }
     }
 }
 
+/// Write pending TLS records directly, without reading from the socket.
+fn drain_tls(stream: &mut StreamOwned<ServerConnection, TcpStream>) -> std::io::Result<()> {
+    while stream.conn.wants_write() {
+        match stream.conn.write_tls(&mut stream.sock) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "TLS write returned zero bytes",
+                ))
+            }
+            Ok(_) => {}
+            Err(err) if transient(err.kind()) => break,
+            Err(err) => return Err(err),
+        }
+    }
+    stream.sock.flush()
+}
+
+fn transient(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::TimedOut | ErrorKind::WouldBlock | ErrorKind::Interrupted
+    )
+}
+
 impl Transport {
+    /// Set a short socket read timeout so a shared writer can take the
+    /// transport lock while a WebSocket reader waits for the next frame.
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Transport::Plain(stream) => stream.set_read_timeout(timeout),
+            Transport::Tls(Some(stream)) => stream.get_ref().set_read_timeout(timeout),
+            Transport::Tls(None) => Ok(()),
+        }
+    }
+
     /// Close the connection. A TLS connection sends `close_notify` first so
     /// the peer sees a clean shutdown instead of a truncated stream.
     fn shutdown(&mut self) -> std::io::Result<()> {
@@ -411,6 +465,7 @@ struct Connection {
     idle_timeout: Duration,
     keep_alive: bool,
     websocket: bool,
+    rooms: Arc<RoomHub>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -427,6 +482,7 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
         idle_timeout,
         keep_alive,
         websocket,
+        rooms,
         shutdown,
     } = connection;
     let requires_client_auth = tls_config
@@ -532,7 +588,7 @@ fn handle_connection(stream: TcpStream, connection: Connection) -> std::io::Resu
                     // A WebSocket upgrade takes over the connection.
                     if websocket {
                         if let Some(key) = websocket::upgrade_key(&request) {
-                            return serve_websocket(&mut reader, key);
+                            return serve_websocket(reader, key, rooms);
                         }
                     }
                     let method = request.method.as_str().to_string();
@@ -706,24 +762,288 @@ pub(crate) fn write_response_head_aware<W: Write>(
     writer.flush()
 }
 
+type ClientId = u64;
+type OutboundFrame = Vec<u8>;
+
+const WS_READ_TIMEOUT: Duration = Duration::from_millis(10);
+
+#[derive(Default)]
+struct HubState {
+    rooms: RoomRegistry<ClientId>,
+    senders: BTreeMap<ClientId, mpsc::Sender<OutboundFrame>>,
+}
+
+#[derive(Default)]
+struct RoomHub {
+    state: Mutex<HubState>,
+    next_id: AtomicU64,
+}
+
+impl RoomHub {
+    fn register(&self) -> (ClientId, mpsc::Receiver<OutboundFrame>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (sender, receiver) = mpsc::channel();
+        let mut state = lock(&self.state);
+        state.senders.insert(id, sender);
+        (id, receiver)
+    }
+
+    fn deregister(&self, id: ClientId) {
+        let mut state = lock(&self.state);
+        state.rooms.leave_all(&id);
+        state.senders.remove(&id);
+    }
+
+    fn join(&self, id: ClientId, room: &str) -> Result<(), RoomError> {
+        let mut state = lock(&self.state);
+        state.rooms.join(room, id)
+    }
+
+    fn leave(&self, id: ClientId, room: &str) -> Result<(), RoomError> {
+        let mut state = lock(&self.state);
+        state.rooms.leave(room, &id)
+    }
+
+    fn broadcast(&self, room: &str, payload: &Value) -> Result<usize, ControlError> {
+        rooms::validate_room_name(room).map_err(ControlError::room)?;
+        let body = json!({
+            "type": "broadcast",
+            "room": room,
+            "payload": payload,
+        })
+        .to_string();
+        if body.len() > websocket::MAX_FRAME_PAYLOAD {
+            return Err(ControlError::new(
+                "payload_too_large",
+                format!(
+                    "broadcast frame exceeds {} bytes",
+                    websocket::MAX_FRAME_PAYLOAD
+                ),
+            ));
+        }
+        let frame = websocket::encode_frame(websocket::Opcode::Text, body.as_bytes(), true, None);
+        let mut state = lock(&self.state);
+        let recipients = state.rooms.broadcast(room).map_err(ControlError::room)?;
+        let mut delivered = 0;
+        let mut broken = Vec::new();
+        for id in recipients {
+            match state.senders.get(&id) {
+                Some(sender) if sender.send(frame.clone()).is_ok() => delivered += 1,
+                _ => broken.push(id),
+            }
+        }
+        for id in broken {
+            state.senders.remove(&id);
+            state.rooms.leave_all(&id);
+        }
+        Ok(delivered)
+    }
+
+    fn send_ack(&self, id: ClientId, kind: &str, room: &str) {
+        let body = json!({ "type": kind, "room": room }).to_string();
+        self.send_frame(id, &body);
+    }
+
+    fn send_error(&self, id: ClientId, error: &ControlError) {
+        let body = json!({
+            "type": "error",
+            "error": error.code,
+            "message": error.message.as_str(),
+        })
+        .to_string();
+        self.send_frame(id, &body);
+    }
+
+    fn send_frame(&self, id: ClientId, body: &str) {
+        let frame = websocket::encode_frame(websocket::Opcode::Text, body.as_bytes(), true, None);
+        let mut state = lock(&self.state);
+        let broken = match state.senders.get(&id) {
+            Some(sender) => sender.send(frame).is_err(),
+            None => true,
+        };
+        if broken {
+            state.senders.remove(&id);
+            state.rooms.leave_all(&id);
+        }
+    }
+}
+
+struct ControlError {
+    code: &'static str,
+    message: String,
+}
+
+impl ControlError {
+    fn new(code: &'static str, message: impl Into<String>) -> ControlError {
+        ControlError {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn invalid(message: impl Into<String>) -> ControlError {
+        ControlError::new("invalid_control", message)
+    }
+
+    fn room(error: RoomError) -> ControlError {
+        let code = error.code();
+        ControlError::new(code, error.to_string())
+    }
+}
+
+enum Control {
+    Join { room: String },
+    Leave { room: String },
+    Broadcast { room: String, payload: Value },
+}
+
+fn control_room(object: &serde_json::Map<String, Value>) -> Result<String, ControlError> {
+    object
+        .get("room")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| ControlError::invalid("room must be a string"))
+}
+
+/// Parse a JSON control object. Other text remains an ordinary echo message.
+fn parse_control(text: &str) -> Result<Option<Control>, ControlError> {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return Ok(None);
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(None);
+    };
+    let Some(kind) = object.get("type") else {
+        return Ok(None);
+    };
+    let Some(kind) = kind.as_str() else {
+        return Err(ControlError::invalid("type must be a string"));
+    };
+    let room = || control_room(object);
+    match kind {
+        "join" => Ok(Some(Control::Join { room: room()? })),
+        "leave" => Ok(Some(Control::Leave { room: room()? })),
+        "broadcast" => {
+            let payload = object
+                .get("payload")
+                .cloned()
+                .ok_or_else(|| ControlError::invalid("payload is required"))?;
+            Ok(Some(Control::Broadcast {
+                room: room()?,
+                payload,
+            }))
+        }
+        other => Err(ControlError::new(
+            "unknown_control_type",
+            format!("unknown control type: {}", short(other)),
+        )),
+    }
+}
+
+fn short(value: &str) -> String {
+    value.chars().take(64).collect()
+}
+
+fn handle_control(rooms: &RoomHub, id: ClientId, control: Control) {
+    match control {
+        Control::Join { room } => match rooms.join(id, &room) {
+            Ok(()) => rooms.send_ack(id, "joined", &room),
+            Err(error) => rooms.send_error(id, &ControlError::room(error)),
+        },
+        Control::Leave { room } => match rooms.leave(id, &room) {
+            Ok(()) => rooms.send_ack(id, "left", &room),
+            Err(error) => rooms.send_error(id, &ControlError::room(error)),
+        },
+        Control::Broadcast { room, payload } => {
+            if let Err(error) = rooms.broadcast(&room, &payload) {
+                rooms.send_error(id, &error);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SharedIo(Arc<Mutex<BufReader<Transport>>>);
+
+impl SharedIo {
+    fn new(reader: BufReader<Transport>) -> SharedIo {
+        SharedIo(Arc::new(Mutex::new(reader)))
+    }
+}
+
+impl Read for SharedIo {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let mut guard = lock(&self.0);
+            match guard.read(buf) {
+                Ok(read) => return Ok(read),
+                Err(err) if transient(err.kind()) => {
+                    drop(guard);
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+impl Write for SharedIo {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut guard = lock(&self.0);
+        guard.get_mut().write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut guard = lock(&self.0);
+        guard.get_mut().flush()
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Serve the WebSocket side of one connection after a successful handshake.
 ///
-/// The bytes the HTTP parser already buffered belong to the WebSocket
-/// stream, so they are handed to the channel instead of the socket.
-fn serve_websocket<R: Read + Write>(reader: &mut BufReader<R>, key: &str) -> std::io::Result<()> {
+/// The buffered HTTP bytes stay in one shared `BufReader`: the reader decodes
+/// inbound frames while an outbound queue writes room broadcasts in order.
+fn serve_websocket(
+    mut reader: BufReader<Transport>,
+    key: &str,
+    rooms: Arc<RoomHub>,
+) -> std::io::Result<()> {
     reader
         .get_mut()
         .write_all(&websocket::handshake_response(key))?;
     reader.get_mut().flush()?;
-    let prefix = reader.buffer().to_vec();
-    let mut channel = ServerChannel::new(reader.get_mut(), prefix);
+    reader.get_mut().set_read_timeout(Some(WS_READ_TIMEOUT))?;
+    let shared = SharedIo::new(reader);
+    let (id, outbound) = rooms.register();
+    let mut writer = shared.clone();
+    thread::spawn(move || {
+        while let Ok(frame) = outbound.recv() {
+            if writer.write_all(&frame).is_err() || writer.flush().is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut channel_io = shared.clone();
+    let mut channel = ServerChannel::new(&mut channel_io, Vec::new());
     while let Ok(message) = channel.recv() {
         match message {
-            websocket::WsMessage::Text(text) => {
-                if channel.send_text(&text).is_err() {
-                    break;
+            websocket::WsMessage::Text(text) => match parse_control(&text) {
+                Ok(Some(control)) => handle_control(&rooms, id, control),
+                Ok(None) => {
+                    if channel.send_text(&text).is_err() {
+                        break;
+                    }
                 }
-            }
+                Err(error) => rooms.send_error(id, &error),
+            },
             websocket::WsMessage::Binary(data) => {
                 if channel.send_binary(&data).is_err() {
                     break;
@@ -736,6 +1056,7 @@ fn serve_websocket<R: Read + Write>(reader: &mut BufReader<R>, key: &str) -> std
             websocket::WsMessage::Pong(_) | websocket::WsMessage::Ping(_) => {}
         }
     }
+    rooms.deregister(id);
     Ok(())
 }
 
