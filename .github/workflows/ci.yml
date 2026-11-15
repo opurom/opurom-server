@@ -48,17 +48,31 @@ jobs:
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/.."
           case "$(basename "$GITHUB_WORKSPACE")" in
-            opurom-render|opurom-platform|opurom-cli)
+            opurom-render)
+              git clone --depth 1 "https://github.com/opurom/opurom-examples.git" opurom-examples
+              # catalog parity test reads ../opurom-lang/src/catalog.json
+              git clone --depth 1 "https://github.com/opurom/opurom-lang.git" opurom-lang
+              ;;
+            opurom-platform|opurom-cli)
               git clone --depth 1 "https://github.com/opurom/opurom-examples.git" opurom-examples
               ;;
-            opurom-examples)
-              for repo in opurom-core opurom-lang opurom-render opurom-cli; do
+            opurom-lang)
+              for repo in opurom-render opurom-examples; do
                 git clone --depth 1 "https://github.com/opurom/${repo}.git" "$repo"
               done
               ;;
             opurom-server)
               # codegen.rs resolves the workspace by finding both sibling crates.
               git clone --depth 1 "https://github.com/opurom/opurom-db.git" opurom-db
+              ;;
+            opurom-mobile)
+              git clone --depth 1 "https://github.com/opurom/opurom-render.git" opurom-render
+              git clone --depth 1 "https://github.com/opurom/opurom-examples.git" opurom-examples
+              ;;
+            opurom-examples)
+              for repo in opurom-core opurom-lang opurom-render opurom-cli; do
+                git clone --depth 1 "https://github.com/opurom/${repo}.git" "$repo"
+              done
               ;;
             *) ;;
           esac

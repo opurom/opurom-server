@@ -57,12 +57,15 @@ if (process.argv.includes('--repo-only')) {
   const tag = process.argv[i + 1];
   if (!tag) { console.error('usage: node release-notes.mjs --repo-only <tag> [prev-tag]'); process.exit(1); }
   const prev = process.argv[i + 2] || prevTagOf(tag);
-  const b = group(collectSubjects(tag, prev), '');  // repo mode: no per-entry links
+  // The first release compares against the root commit, not an empty base.
+  const base = prev || execFileSync('git', ['rev-list', '--max-parents=0', tag], { encoding: 'utf8' }).split('\n')[0].trim().slice(0, 7);
+  const b = group(collectSubjects(tag, base), '');  // repo mode: no per-entry links
   const parts = [];
   for (const h of ['Features', 'Changes', 'Fixes']) {
     if (b[h].length) parts.push(`### ${h}\n${b[h].join('\n')}`);
   }
-  parts.push(`**Full Changelog**: https://github.com/opurom/${process.env.GITHUB_REPOSITORY || 'opurom/opurom-release'}/compare/${prev || ''}...${tag}`);
+  const repo = process.env.GITHUB_REPOSITORY || 'opurom/opurom-release';
+  parts.push(`**Full Changelog**: https://github.com/${repo}/compare/${base}...${tag}`);
   process.stdout.write(parts.join('\n\n') + '\n');
   process.exit(0);
 }

@@ -23,20 +23,12 @@ jobs:
           # the notes need the previous tag and the commits between them
           fetch-depth: 0
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Generate changelog for this tag
-        run: |
-          set -euo pipefail
-          TAG="$TAG"
-          # previous tag reachable from this tag's parent; first release has none
-          PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
-          [ -z "$PREV" ] && PREV=$(git rev-list --max-parents=0 HEAD)
-          {
-            echo "## Changes"
-            git log --format='- %s' "$PREV..$TAG" | sed 's/^feat: */- Add /;s/^fix: */- Fix /;s/^refactor: */- Refactor /' | head -50
-            echo ""
-            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/$PREV...$TAG"
-          } > notes.md
-          cat notes.md
+        run: node .github/scripts/release-notes.mjs --repo-only "$TAG" > notes.md && cat notes.md
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
