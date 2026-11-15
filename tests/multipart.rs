@@ -3,7 +3,8 @@
 
 use opurom_server::http::{Method, Request};
 use opurom_server::multipart::{
-    boundary_from_content_type, first_file_part, parse_multipart, MultipartError, MAX_MULTIPART_BODY,
+    boundary_from_content_type, first_file_part, parse_multipart, MultipartError,
+    MAX_MULTIPART_BODY,
 };
 
 const BOUNDARY: &str = "----opuromBoundary7MA4YWxkTrZu0gW";
@@ -77,7 +78,9 @@ fn parses_a_text_field_and_a_file_part() {
 fn first_file_part_selects_the_upload_and_skips_fields() {
     let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
     let request = request(&content_type, multipart_body());
-    let file = first_file_part(&request).unwrap().expect("a file part exists");
+    let file = first_file_part(&request)
+        .unwrap()
+        .expect("a file part exists");
     assert_eq!(file.name, "image");
     assert_eq!(file.filename.as_deref(), Some("sunset.png"));
 }

@@ -13,8 +13,8 @@ use opurom_server::middleware::MiddlewareChain;
 use opurom_server::router::Router;
 use opurom_server::server::Server;
 use opurom_server::session::{
-    clear_session_cookie, cookie_value, require_role, session_cookie,
-    session_gate, session_user, Role, SessionStore, SESSION_COOKIE,
+    clear_session_cookie, cookie_value, require_role, session_cookie, session_gate, session_user,
+    Role, SessionStore, SESSION_COOKIE,
 };
 
 #[derive(Debug)]
@@ -100,8 +100,7 @@ fn router(store: SessionStore) -> Router {
             .and_then(Role::parse)
             .unwrap_or(Role::Member);
         let id = login_store.create(user, role);
-        Response::json_text(200, "{\"ok\":true}")
-            .with_header("Set-Cookie", &session_cookie(&id))
+        Response::json_text(200, "{\"ok\":true}").with_header("Set-Cookie", &session_cookie(&id))
     });
 
     let me_store = store.clone();
@@ -126,8 +125,7 @@ fn router(store: SessionStore) -> Router {
         if let Some(id) = opurom_server::session::session_id_from_cookie(request) {
             logout_store.destroy(&id);
         }
-        Response::json_text(200, "{\"ok\":true}")
-            .with_header("Set-Cookie", &clear_session_cookie())
+        Response::json_text(200, "{\"ok\":true}").with_header("Set-Cookie", &clear_session_cookie())
     });
 
     router
@@ -142,8 +140,8 @@ fn start() -> (u16, Arc<AtomicBool>, SessionStore) {
     }
     let mut chain = MiddlewareChain::new();
     chain.push(session_gate(store.clone(), protected));
-    let server = Server::bind_with("127.0.0.1:0", router(store.clone()), chain, 64 * 1024)
-        .expect("bind");
+    let server =
+        Server::bind_with("127.0.0.1:0", router(store.clone()), chain, 64 * 1024).expect("bind");
     let (addr, shutdown) = server.spawn().expect("spawn");
     (addr.port(), shutdown, store)
 }
@@ -153,7 +151,11 @@ fn login_grants_access_and_anonymous_is_rejected() {
     let (port, _shutdown, _store) = start();
 
     assert_eq!(send(port, "GET", "/health", None).status, 200);
-    assert_eq!(send(port, "GET", "/me", None).status, 401, "no cookie -> 401");
+    assert_eq!(
+        send(port, "GET", "/me", None).status,
+        401,
+        "no cookie -> 401"
+    );
 
     let login = send_body(port, "POST", "/login", None, "{\"user\":\"ada\"}");
     assert_eq!(login.status, 200);
@@ -173,7 +175,9 @@ fn forged_or_unknown_cookie_is_rejected() {
         port,
         "GET",
         "/me",
-        Some(&format!("{SESSION_COOKIE}=deadbeefdeadbeefdeadbeefdeadbeef")),
+        Some(&format!(
+            "{SESSION_COOKIE}=deadbeefdeadbeefdeadbeefdeadbeef"
+        )),
     );
     assert_eq!(forged.status, 401, "an unknown id does not authenticate");
 }
@@ -268,4 +272,3 @@ fn role_ordering_is_guest_member_admin() {
     assert_eq!(Role::parse("ADMIN"), Some(Role::Admin));
     assert_eq!(Role::parse("root"), None);
 }
-

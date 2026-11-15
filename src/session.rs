@@ -220,9 +220,10 @@ pub fn session_gate(
                 request
                     .params
                     .insert("session.user".to_string(), session.user);
-                request
-                    .params
-                    .insert("session.role".to_string(), session.role.as_str().to_string());
+                request.params.insert(
+                    "session.role".to_string(),
+                    session.role.as_str().to_string(),
+                );
                 return None;
             }
             // Present but invalid/expired: fall through to the gate check.

@@ -92,16 +92,18 @@ pub fn boundary_from_content_type(value: &str) -> Option<String> {
 /// `content_type` is the request's `Content-Type` header; `body` is the raw
 /// bytes. The delimiter is `--boundary`, the final boundary is followed by
 /// `--`, and each part is separated from its value by a blank line.
-pub fn parse_multipart(content_type: &str, body: &[u8]) -> Result<Vec<MultipartPart>, MultipartError> {
+pub fn parse_multipart(
+    content_type: &str,
+    body: &[u8],
+) -> Result<Vec<MultipartPart>, MultipartError> {
     if body.len() > MAX_MULTIPART_BODY {
         return Err(MultipartError::new(format!(
             "multipart body of {} bytes exceeds the {MAX_MULTIPART_BODY}-byte limit",
             body.len()
         )));
     }
-    let boundary = boundary_from_content_type(content_type).ok_or_else(|| {
-        MultipartError::new("missing or invalid multipart/form-data boundary")
-    })?;
+    let boundary = boundary_from_content_type(content_type)
+        .ok_or_else(|| MultipartError::new("missing or invalid multipart/form-data boundary"))?;
     let delimiter = format!("--{boundary}").into_bytes();
     let mut parts = Vec::new();
     let mut pos = delimiter_search(body, &delimiter, 0)?;
@@ -170,9 +172,7 @@ fn skip_crlf(body: &[u8], pos: usize) -> usize {
 fn delimiter_search(body: &[u8], needle: &[u8], from: usize) -> Result<usize, MultipartError> {
     let mut i = from;
     while i + needle.len() <= body.len() {
-        if &body[i..i + needle.len()] == needle
-            && (i == 0 || body[i - 1] == b'\n')
-        {
+        if &body[i..i + needle.len()] == needle && (i == 0 || body[i - 1] == b'\n') {
             return Ok(i);
         }
         i += 1;
@@ -189,7 +189,10 @@ fn find_header_end(block: &[u8]) -> Option<usize> {
 fn parse_disposition(headers: &str) -> Result<(String, Option<String>), MultipartError> {
     let line = headers
         .lines()
-        .find(|line| line.to_ascii_lowercase().starts_with("content-disposition:"))
+        .find(|line| {
+            line.to_ascii_lowercase()
+                .starts_with("content-disposition:")
+        })
         .ok_or_else(|| MultipartError::new("multipart part is missing Content-Disposition"))?;
     let name = header_param(line, "name")
         .ok_or_else(|| MultipartError::new("multipart part is missing a field name"))?;
@@ -226,7 +229,9 @@ fn header_param(line: &str, key: &str) -> Option<String> {
         }
         return None;
     } else {
-        rest.split([';', ' ', '\t', '\r', '\n']).next().unwrap_or("")
+        rest.split([';', ' ', '\t', '\r', '\n'])
+            .next()
+            .unwrap_or("")
     };
     if value.is_empty() {
         None
