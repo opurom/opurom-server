@@ -166,7 +166,8 @@ fn router() -> Router {
 }
 
 fn with_dev_headers(contract: RequestSpec) -> RequestSpec {
-    contract.with_header("Authorization", "Bearer devtoken")
+    contract
+        .with_header("Authorization", "Bearer devtoken")
         .with_header("Origin", "https://app.example")
 }
 
