@@ -195,7 +195,9 @@ impl Router {
             if !method_serves(&route.method, &request.method) {
                 continue;
             }
-            request.params = params;
+            // Extend, do not replace: middleware may already have stashed
+            // context (e.g. session.user/role) in params before routing.
+            request.params.extend(params);
             if route.disabled.load(Ordering::Relaxed) == 1 {
                 return Response::error(503, "route_disabled");
             }
