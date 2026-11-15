@@ -32,6 +32,7 @@ pub mod http2;
 pub mod http3;
 pub mod ir;
 pub mod middleware;
+pub mod multipart;
 pub mod pool;
 pub mod query;
 pub mod rooms;
@@ -60,6 +61,10 @@ pub use middleware::{
     AuthOptions, HttpOptions, MiddlewareChain, RateLimiter, ALT_SVC_ENV, AUTH_TOKEN_ENV,
     CACHE_CONTROL_ENV, CORS_ENV, ETAG_ENV, GZIP_THRESHOLD_BYTES, HEALTH_PATH, RATE_LIMIT_ENV,
     RATE_LIMIT_WINDOW_SECS, RESPONSE_STAGES, STRUCTURED_LOG_ENV,
+};
+pub use multipart::{
+    boundary_from_content_type, first_file_part, parse_multipart, MultipartError, MultipartPart,
+    MAX_MULTIPART_BODY, MAX_PARTS, MAX_PART_HEADER,
 };
 pub use pool::{ConnectionPool, Lease, PoolError, PoolMetrics, DEFAULT_IDLE_TIMEOUT_MS};
 pub use query::{ListQuery, QueryError, DEFAULT_LIMIT, MAX_LIMIT, MAX_OFFSET};
