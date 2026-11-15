@@ -664,9 +664,8 @@ fn demo_server_reports_alpn_and_mtls_refusal_diagnostics() {
         REQUEST,
     ));
     let text = server
-        .wait_for(|text| text.matches("mTLS handshake refused").count() >= 1)
+        .wait_for(|text| text.contains("mTLS handshake refused") && text.contains("OPR_CLIENT_CA"))
         .expect("a missing certificate writes a clear diagnostic");
-    assert!(text.contains("OPR_CLIENT_CA"), "{}", text);
     println!("[mTLS] missing certificate diagnostic: {}", missing);
 
     let untrusted = refused(https_request(
@@ -677,8 +676,10 @@ fn demo_server_reports_alpn_and_mtls_refusal_diagnostics() {
         REQUEST,
     ));
     let text = server
-        .wait_for(|text| text.matches("mTLS handshake refused").count() >= 2)
+        .wait_for(|text| {
+            text.matches("mTLS handshake refused").count() >= 2
+                && text.contains("client certificate")
+        })
         .expect("an untrusted certificate writes a clear diagnostic");
-    assert!(text.contains("client certificate"), "{}", text);
     println!("[mTLS] untrusted certificate diagnostic: {}", untrusted);
 }
