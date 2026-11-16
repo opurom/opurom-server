@@ -6,8 +6,8 @@
 //! [`Session`], the client carries the id in an HttpOnly cookie, and the
 //! middleware resolves it before the handler runs. Sessions expire after an
 //! idle timeout, and every id is a 128-bit random token so ids cannot be
-//! guessed. There are no passwords here — a caller supplies the identity once
-//! credentials have been checked elsewhere.
+//! guessed. Login helpers validate a credential body against an account row
+//! and issue or revoke the cookie; the credential digest is documented below.
 //!
 //! Access control is a small ordered role ladder: `guest < member < admin`.
 //! [`require_role`] answers 401 for a missing session and 403 for a session
@@ -17,8 +17,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use sha2::{Digest, Sha256};
+
 use crate::http::{Method, Request, Response};
 use crate::middleware::constant_time_eq;
+use crate::serde_json::{Map, Value as Json};
 
 /// The cookie name that carries the session id.
 pub const SESSION_COOKIE: &str = "opurom_session";
@@ -283,4 +286,90 @@ fn splitmix64(mut z: u64) -> u64 {
 /// handler that echoes or re-checks an id cannot leak it by timing.
 pub fn ids_equal(a: &str, b: &str) -> bool {
     constant_time_eq(a.as_bytes(), b.as_bytes())
+}
+
+/// True when session enforcement is on: `OPR_SESSION` set to a truthy value.
+/// Generated services call this so one binary serves both modes and the
+/// default stays byte-identical with the variable unset.
+pub fn sessions_enabled() -> bool {
+    let raw = std::env::var("OPR_SESSION").unwrap_or_default();
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Credential digest stored at rest: SHA-256 hex.
+///
+/// Limitation: a salted password KDF (argon2-class) must replace this before
+/// production; the framework ships no KDF dependency yet, and a plain digest
+/// is still strictly better than storing the password itself.
+pub fn hash_password(password: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Replace the `password` field of a registration body with its digest, so a
+/// `create` handler for the account model never writes the raw password.
+pub fn hash_registration(body: Json) -> Json {
+    let Some(object) = body.as_object() else {
+        return body;
+    };
+    let Some(password) = object.get("password").and_then(Json::as_str) else {
+        return body;
+    };
+    let mut object = object.clone();
+    object.insert(
+        "password".to_string(),
+        Json::String(hash_password(password)),
+    );
+    Json::Object(object)
+}
+
+/// Read validated credentials from a login body: both fields required,
+/// bounded at 128 bytes, username trimmed. Invalid bodies answer 400 before
+/// any database lookup.
+pub fn login_credentials(request: &Request) -> Result<(String, String), Response> {
+    let body = request
+        .json()
+        .map_err(|_| Response::error(400, "invalid_request"))?;
+    let object = body
+        .as_object()
+        .ok_or_else(|| Response::error(400, "invalid_request"))?;
+    let username = object
+        .get("username")
+        .and_then(Json::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let password = object
+        .get("password")
+        .and_then(Json::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if username.is_empty() || password.is_empty() || username.len() > 128 || password.len() > 128 {
+        return Err(Response::error(400, "invalid_request"));
+    }
+    Ok((username, password))
+}
+
+/// Issue a session for a verified identity: 200 with the role payload and the
+/// HttpOnly session cookie.
+pub fn login_response(store: &SessionStore, user: &str, role: Role) -> Response {
+    let id = store.create(user, role);
+    let mut payload = Map::new();
+    payload.insert("user".to_string(), Json::String(user.to_string()));
+    payload.insert("role".to_string(), Json::String(role.as_str().to_string()));
+    Response::json_text(200, &Json::Object(payload).to_string())
+        .with_header("Set-Cookie", &session_cookie(&id))
+}
+
+/// End a session: destroy the id when present and clear the cookie. Logout is
+/// idempotent and always answers 200.
+pub fn logout_response(store: &SessionStore, request: &Request) -> Response {
+    if let Some(id) = session_id_from_cookie(request) {
+        store.destroy(&id);
+    }
+    Response::json_text(200, "{\"ok\":true}").with_header("Set-Cookie", &clear_session_cookie())
 }

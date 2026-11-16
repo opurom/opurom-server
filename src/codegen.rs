@@ -246,15 +246,29 @@ fn main_rs(ir: &Ir) -> String {
     out.push_str(ROW_JSON);
     out.push_str(ID_HELPERS);
 
+    let account = account_model(ir);
+    let registration = account.and_then(|found| registration_path(ir, found));
+    if account.is_some() {
+        out.push_str(&protected_fn(registration));
+    }
+
     // The router builder opens the function the handlers are emitted into.
-    out.push_str(ROUTER_BUILD);
+    out.push_str(&router_build(account.is_some()));
 
     // Handlers, lowered per api entry.
     for api in &ir.api {
         out.push_str(&handlers_for(ir, api));
     }
 
-    out.push_str(MAIN_FN);
+    // Session and upload routes, lowered only when the IR declares them.
+    if let Some(found) = account {
+        out.push_str(&session_routes(found));
+    }
+    if enables_uploads(ir) {
+        out.push_str(&upload_routes(account.is_some()));
+    }
+
+    out.push_str(&main_fn(account.is_some()));
     out
 }
 
@@ -372,6 +386,122 @@ fn next_id(db: &mut Sqlite, table: &str, primary: &str) -> DbValue {
 "#;
 
 /// Router construction.
+/// Whether a request needs a resolved session: every mutation except login
+/// and registration. Reads stay public, like a forum's open threads.
+fn protected_fn(registration: Option<&str>) -> String {
+    match registration {
+        Some(path) => format!(
+            "fn protected(request: &Request) -> bool {{\n    if request.method == Method::Get {{\n        return false;\n    }}\n    !(request.method == Method::Post\n        && (request.path == \"/sessions\"\n            || request.path == \"{path}\"))\n}}\n\n"
+        ),
+        None => "fn protected(request: &Request) -> bool {\n    if request.method == Method::Get {\n        return false;\n    }\n    request.method != Method::Post || request.path != \"/sessions\"\n}\n\n".to_string(),
+    }
+}
+
+/// The session endpoints, emitted only for an IR that declares an account
+/// model: login verifies the stored digest in constant time and issues the
+/// cookie, logout revokes it.
+fn session_routes(account: &Model) -> String {
+    let table = account.table();
+    format!(
+        "    // Session endpoints: login verifies the stored digest, logout revokes.\n\
+         let login_sessions = sessions.clone();\n\
+         let login_db = db.clone();\n\
+         router.route(Method::Post, \"/sessions\", move |request: &mut Request| {{\n\
+             let (username, password) = match opurom_server::session::login_credentials(request) {{\n\
+                 Ok(creds) => creds,\n\
+                 Err(response) => return response,\n\
+             }};\n\
+             let rows = match login_db.with(|guard| {{\n\
+                 guard.query_params(\n\
+                     \"SELECT * FROM {table} WHERE username = ?;\",\n\
+                     &[DbValue::Text(username.clone())],\n\
+                 )\n\
+             }}) {{\n\
+                 Ok(rows) => rows,\n\
+                 Err(err) => return Response::error(500, &format!(\"database_error: {{}}\", err)),\n\
+             }};\n\
+             let row = match rows.first() {{\n\
+                 Some(row) => row,\n\
+                 None => return Response::error(401, \"invalid_credentials\"),\n\
+             }};\n\
+             let stored = match row.get(\"password\").and_then(DbValue::as_str) {{\n\
+                 Some(value) => value,\n\
+                 None => return Response::error(401, \"invalid_credentials\"),\n\
+             }};\n\
+             let digest = opurom_server::session::hash_password(&password);\n\
+             if !opurom_server::middleware::constant_time_eq(stored.as_bytes(), digest.as_bytes()) {{\n\
+                 return Response::error(401, \"invalid_credentials\");\n\
+             }}\n\
+             let role = row\n\
+                 .get(\"role\")\n\
+                 .and_then(DbValue::as_str)\n\
+                 .and_then(opurom_server::session::Role::parse)\n\
+                 .unwrap_or(opurom_server::session::Role::Member);\n\
+             opurom_server::session::login_response(&login_sessions, &username, role)\n\
+         }});\n\
+         let logout_sessions = sessions.clone();\n\
+         router.route(Method::Delete, \"/sessions\", move |request: &mut Request| {{\n\
+             opurom_server::session::logout_response(&logout_sessions, request)\n\
+         }});\n\n",
+        table = table
+    )
+}
+
+/// The upload endpoints, emitted for an IR that declares an `attachment`
+/// field: POST stores a multipart file part under the data directory, GET
+/// serves it back by stored name.
+fn upload_routes(has_account: bool) -> String {
+    let gate = if has_account {
+        role_gate("Member")
+    } else {
+        String::new()
+    };
+    format!(
+        "    // Uploads: store a file part under the data dir, then serve it back.\n\
+         let uploads_root = opurom_server::upload::upload_dir_from_env();\n\
+         let upload_dir = uploads_root.clone();\n\
+         router.route(Method::Post, \"/uploads\", move |request: &mut Request| {{\n\
+{gate}            opurom_server::upload::upload_response(request, &upload_dir)\n\
+         }});\n\
+         let serve_dir = uploads_root;\n\
+         router.route(Method::Get, \"/uploads/:name\", move |request: &mut Request| {{\n\
+             let name = request.param(\"name\").unwrap_or_default();\n\
+             opurom_server::upload::download_response(&serve_dir, name)\n\
+         }});\n\n",
+        gate = gate
+    )
+}
+
+/// The router builder; the sessions parameter appears only when the IR
+/// declares an account model, so other services keep their exact signature.
+fn router_build(session: bool) -> String {
+    if session {
+        ROUTER_BUILD.replace(
+            "fn build_router(db: PooledDb) -> Router {",
+            "fn build_router(db: PooledDb, sessions: opurom_server::session::SessionStore) -> Router {",
+        )
+    } else {
+        ROUTER_BUILD.to_string()
+    }
+}
+
+/// The generated `main`; the session store and the gate join the chain only
+/// for an IR with an account model.
+fn main_fn(session: bool) -> String {
+    let text = MAIN_FN.to_string();
+    if !session {
+        return text;
+    }
+    text.replace(
+        "    let mut router = build_router(pool);",
+        "    let sessions = opurom_server::session::SessionStore::default();\n    let mut router = build_router(pool, sessions.clone());",
+    )
+    .replace(
+        "    chain.push(body_cap(1024 * 1024));",
+        "    chain.push(body_cap(1024 * 1024));\n    if opurom_server::session::sessions_enabled() {\n        chain.push(opurom_server::session::session_gate(sessions.clone(), protected));\n    }",
+    )
+}
+
 const ROUTER_BUILD: &str = r#"#[allow(unused_variables)]
 fn build_router(db: PooledDb) -> Router {
     let mut router = Router::new();
@@ -494,12 +624,12 @@ const GET_HANDLER: &str = r#"    let get_db = db.clone();
 
 const CREATE_HANDLER: &str = r#"    let create_db = db.clone();
     router.route(Method::Post, "{{PATH}}", move |request: &mut Request| {
-        create_db.with(|guard| {
+{{ROLE_GATE}}        create_db.with(|guard| {
         let body = match request.json() {
             Ok(value) => value,
             Err(_) => return Response::error(400, "invalid_json"),
         };
-        let object = match body.as_object() {
+{{BODY_HOOK}}        let object = match body.as_object() {
             Some(object) => object,
             None => return Response::error(400, "invalid_json"),
         };
@@ -524,7 +654,7 @@ const CREATE_HANDLER: &str = r#"    let create_db = db.clone();
 
 const UPDATE_HANDLER: &str = r#"    let update_db = db.clone();
     router.route(Method::Put, "{{PATH}}", move |request: &mut Request| {
-        update_db.with(|guard| {
+{{ROLE_GATE}}        update_db.with(|guard| {
         let raw_id = request.param("{{PARAM}}").unwrap_or_default().to_string();
         let id_value = match parse_id(&raw_id) {
             Some(value) => value,
@@ -561,7 +691,7 @@ const UPDATE_HANDLER: &str = r#"    let update_db = db.clone();
 
 const DELETE_HANDLER: &str = r#"    let delete_db = db.clone();
     router.route(Method::Delete, "{{PATH}}", move |request: &mut Request| {
-        delete_db.with(|guard| {
+{{ROLE_GATE}}        delete_db.with(|guard| {
         let raw_id = request.param("{{PARAM}}").unwrap_or_default().to_string();
         let id_value = match parse_id(&raw_id) {
             Some(value) => value,
@@ -583,6 +713,48 @@ const DELETE_HANDLER: &str = r#"    let delete_db = db.clone();
     });
 "#;
 
+/// The account model carries `username` and `password` text fields; its
+/// presence turns on session login, the gate and the role ladder.
+fn account_model(ir: &Ir) -> Option<&Model> {
+    ir.models.iter().find(|model| {
+        ["username", "password"].iter().all(|name| {
+            model
+                .fields
+                .iter()
+                .any(|f| f.name == *name && f.ty == FieldType::Text)
+        })
+    })
+}
+
+/// True when any model carries an `attachment` field: the service then stores
+/// and serves multipart uploads.
+fn enables_uploads(ir: &Ir) -> bool {
+    ir.models
+        .iter()
+        .any(|model| model.fields.iter().any(|f| f.name == "attachment"))
+}
+
+/// The api path that creates the account model (registration), when declared.
+fn registration_path<'a>(ir: &'a Ir, account: &Model) -> Option<&'a str> {
+    ir.api
+        .iter()
+        .find(|api| api.model == account.name && api.handlers.iter().any(|v| v == "create"))
+        .map(|api| api.path.as_str())
+}
+
+/// One emitted role check: 401 without a session, 403 below the role, and
+/// inactive unless `OPR_SESSION` is on so defaults stay unchanged.
+fn role_gate(role: &str) -> String {
+    let mut out = String::new();
+    out.push_str("        if opurom_server::session::sessions_enabled() {\n");
+    out.push_str(
+        "            if let Some(response) = opurom_server::session::require_role(request, opurom_server::session::Role::",
+    );
+    out.push_str(role);
+    out.push_str(") {\n                return response;\n            }\n        }\n");
+    out
+}
+
 /// Emit the handler closures for one `api` entry.
 fn handlers_for(ir: &Ir, api: &Api) -> String {
     let model = match ir.model(&api.model) {
@@ -596,6 +768,8 @@ fn handlers_for(ir: &Ir, api: &Api) -> String {
         .unwrap_or_else(|| "id".to_string());
     let param = path_param_name(&api.path).unwrap_or("id");
     let table = model.table();
+    let account = account_model(ir);
+    let is_account_api = account.is_some_and(|found| found.name == api.model);
     let mut out = String::new();
 
     for verb in &api.handlers {
@@ -606,6 +780,20 @@ fn handlers_for(ir: &Ir, api: &Api) -> String {
             "update" => UPDATE_HANDLER,
             "delete" => DELETE_HANDLER,
             _ => continue,
+        };
+        // Sessions off -> no gate at all; registration stays open; every
+        // other create needs a member; replaces and removals need an admin.
+        let role_gate = match (account.is_some(), verb.as_str(), is_account_api) {
+            (false, _, _) => String::new(),
+            (true, "create", true) => String::new(),
+            (true, "create", false) => role_gate("Member"),
+            (true, "update" | "delete", _) => role_gate("Admin"),
+            _ => String::new(),
+        };
+        let body_hook = if verb.as_str() == "create" && is_account_api {
+            "        let body = opurom_server::session::hash_registration(body);\n".to_string()
+        } else {
+            String::new()
         };
         let select_sql = format!("SELECT * FROM {} WHERE {} = ?;", table, primary);
         let list_sql = format!("SELECT * FROM {};", table);
@@ -625,6 +813,8 @@ fn handlers_for(ir: &Ir, api: &Api) -> String {
             ("COLUMNS", columns.as_str()),
             ("ASSIGNMENTS", assignments.as_str()),
             ("ID_VALUE", id_value.as_str()),
+            ("ROLE_GATE", role_gate.as_str()),
+            ("BODY_HOOK", body_hook.as_str()),
         ];
         out.push_str(&fill(template, &values));
     }
@@ -920,11 +1110,25 @@ fn readme(ir: &Ir) -> String {
     out.push_str("* `OPR_HTTP3=1` - serves HTTP/3 over QUIC on a separate UDP listener with TLS 1.3 and ALPN `h3`; `OPR_HTTP3_PORT` chooses the UDP port (default `4433`)\n");
     out.push_str("* `OPR_ALT_SVC_PORT` - the UDP port advertised with `Alt-Svc: h3=\":PORT\"` on the HTTPS responses\n\n");
     out.push_str("* `GET <list route>?limit=&offset=&sort=&order=&q=` - strict bounds (400 on negative, non-integer or over-cap values), stable ordering and a `{items,total,count,limit,offset}` envelope; default limit 50, maximum 1000\n\n");
+    if account_model(ir).is_some() {
+        out.push_str("* `OPR_SESSION=1` - enforce sessions: `POST /sessions` issues an HttpOnly cookie, every mutation needs a session, `PUT`/`DELETE` need the admin role (`401`/`403` otherwise); unset, the routes exist but nothing is gated\n");
+    }
+    if enables_uploads(ir) {
+        out.push_str("* `OPR_DATA` - application data directory for uploads (default `./data`), active when an IR field declares `attachment`\n\n");
+    }
     out.push_str("The service opens one `PooledDb` at startup and shares its Mutex-serialized SQLite connection across all handlers. With no optional hardening env vars and no gzip request header, HTTP responses and stdout stay byte-identical. The rate-limit and log variables never enable the opt-in HTTP response features.\n\n");
     out.push_str("The schema is created at startup from the embedded `migrations/*.sql`.\n\n");
     out.push_str("## Routes\n\n");
     out.push_str("* `GET /health` - `{\"ok\":true,\"app\":\"...\",\"version\":\"0.1.0\"}`\n");
     out.push_str("* `GET /ssr` - server-rendered HTML of the IR tree\n");
+    if account_model(ir).is_some() {
+        out.push_str("* `POST /sessions` - login: `{username,password}` verifies the stored digest, sets the session cookie, `401 invalid_credentials` otherwise\n");
+        out.push_str("* `DELETE /sessions` - logout: revokes the session and clears the cookie\n");
+    }
+    if enables_uploads(ir) {
+        out.push_str("* `POST /uploads` - multipart file part stored under `OPR_DATA/uploads`, answers `{name,size}`\n");
+        out.push_str("* `GET /uploads/:name` - serves a stored upload by name\n");
+    }
     for api in &ir.api {
         for verb in &api.handlers {
             let method = match verb.as_str() {

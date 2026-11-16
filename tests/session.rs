@@ -11,6 +11,7 @@ use std::sync::Arc;
 use opurom_server::http::{Request, Response};
 use opurom_server::middleware::MiddlewareChain;
 use opurom_server::router::Router;
+use opurom_server::serde_json;
 use opurom_server::server::Server;
 use opurom_server::session::{
     clear_session_cookie, cookie_value, require_role, session_cookie, session_gate, session_user,
@@ -271,4 +272,111 @@ fn role_ordering_is_guest_member_admin() {
     assert!(Role::Member < Role::Admin);
     assert_eq!(Role::parse("ADMIN"), Some(Role::Admin));
     assert_eq!(Role::parse("root"), None);
+}
+
+// ---- login/logout helpers ----
+
+#[test]
+fn hash_password_is_stable_sha256_hex() {
+    let digest = opurom_server::session::hash_password("hunter2");
+    assert_eq!(digest.len(), 64, "sha256 hex width");
+    assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(digest, opurom_server::session::hash_password("hunter2"));
+    assert_ne!(digest, opurom_server::session::hash_password("hunter3"));
+}
+
+#[test]
+fn hash_registration_replaces_only_the_password_field() {
+    let body = serde_json::json!({
+        "username": "ada",
+        "password": "s3cret",
+        "role": "admin"
+    });
+    let hashed = opurom_server::session::hash_registration(body);
+    assert_eq!(hashed["username"], "ada", "other fields untouched");
+    assert_eq!(hashed["role"], "admin");
+    let stored = hashed["password"]
+        .as_str()
+        .expect("password stays a string");
+    assert_ne!(stored, "s3cret", "raw password must not survive");
+    assert_eq!(stored, opurom_server::session::hash_password("s3cret"));
+    // A body without a password passes through unchanged.
+    let other = serde_json::json!({"title": "no secret"});
+    assert_eq!(
+        opurom_server::session::hash_registration(other.clone()),
+        other
+    );
+}
+
+#[test]
+fn login_credentials_validate_and_bound_the_body() {
+    let ok = Request {
+        method: opurom_server::http::Method::Post,
+        path: "/sessions".to_string(),
+        body: b"{\"username\":\" ada \",\"password\":\"pw\"}".to_vec(),
+        ..Request::default()
+    };
+    let (user, pass) = opurom_server::session::login_credentials(&ok).expect("valid body");
+    assert_eq!(user, "ada", "username is trimmed");
+    assert_eq!(pass, "pw");
+
+    for bad in [
+        b"not json".to_vec(),
+        b"{\"username\":\"ada\"}".to_vec(),
+        b"{\"username\":\"\",\"password\":\"x\"}".to_vec(),
+        br#"{"username":"ada","password":""}"#.to_vec(),
+        format!(
+            "{{\"username\":\"{}\",\"password\":\"x\"}}",
+            "a".repeat(129)
+        )
+        .into_bytes(),
+    ]
+    .iter()
+    {
+        let request = Request {
+            method: opurom_server::http::Method::Post,
+            path: "/sessions".to_string(),
+            body: bad.clone(),
+            ..Request::default()
+        };
+        let error = opurom_server::session::login_credentials(&request)
+            .expect_err("invalid body must be rejected");
+        assert_eq!(error.status, 400);
+    }
+}
+
+#[test]
+fn login_and_logout_responses_round_trip_the_store() {
+    let store = SessionStore::new(3600);
+    let login = opurom_server::session::login_response(&store, "ada", Role::Admin);
+    assert_eq!(login.status, 200);
+    let cookie = login
+        .headers
+        .iter()
+        .find(|(name, _)| name == "Set-Cookie")
+        .map(|(_, value)| value.clone())
+        .expect("Set-Cookie present");
+    assert!(cookie.contains("HttpOnly"));
+    let id = cookie_value(&cookie, SESSION_COOKIE).expect("session id in cookie");
+    assert_eq!(store.lookup(&id).map(|s| s.role), Some(Role::Admin));
+
+    let logout_request = Request {
+        method: opurom_server::http::Method::Post,
+        path: "/sessions".to_string(),
+        headers: vec![("Cookie".to_string(), format!("{SESSION_COOKIE}={id}"))],
+        ..Request::default()
+    };
+    let logout = opurom_server::session::logout_response(&store, &logout_request);
+    assert_eq!(logout.status, 200);
+    assert!(store.lookup(&id).is_none(), "logout destroys the session");
+    let cleared = logout
+        .headers
+        .iter()
+        .find(|(name, _)| name == "Set-Cookie")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default();
+    assert!(cleared.contains("Max-Age=0"), "cookie is cleared");
+    // Logout without a cookie stays 200 (idempotent).
+    let again = opurom_server::session::logout_response(&store, &Request::default());
+    assert_eq!(again.status, 200);
 }

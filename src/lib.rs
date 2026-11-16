@@ -41,6 +41,7 @@ pub mod server;
 pub mod session;
 pub mod ssr;
 pub mod tls;
+pub mod upload;
 pub mod websocket;
 
 pub use codegen::{default_dep_root, lower_service};
@@ -83,6 +84,10 @@ pub use session::{
 };
 pub use ssr::ssr_html;
 pub use tls::{TlsConfig, TLS_CERT_ENV, TLS_KEY_ENV};
+pub use upload::{
+    download_response as download_upload, upload_dir_from_env, upload_response, DATA_DIR_ENV,
+    MAX_UPLOAD_BYTES,
+};
 pub use websocket::{WsChannel, WsMessage};
 
 /// Re-export of the JSON crate used by this library, so generated services do

@@ -218,3 +218,129 @@ fn the_generated_readme_names_no_round_codename() {
     }
     let _ = fs::remove_dir_all(&out);
 }
+
+/// A forum-shaped IR: an account model (username + password) and a model with
+/// an `attachment` field, so both conditional features must be lowered in.
+const ACCOUNT_IR: &str = r##"{
+  "ir": "0.1.0",
+  "app": "Forum",
+  "state": [],
+  "tree": {
+    "id": 0,
+    "kind": "Column",
+    "props": {},
+    "children": [
+      { "id": 1, "kind": "Text", "props": { "value": "Forum" }, "children": [], "events": {} }
+    ],
+    "events": {}
+  },
+  "theme": { "mode": "system", "accent": "#097FEB", "radius": 12 },
+  "models": [
+    { "name": "User", "fields": [
+      { "name": "id", "type": "int", "primary": true, "default": null },
+      { "name": "username", "type": "string", "primary": false, "default": null },
+      { "name": "password", "type": "string", "primary": false, "default": null },
+      { "name": "role", "type": "string", "primary": false, "default": "member" }
+    ] },
+    { "name": "Post", "fields": [
+      { "name": "id", "type": "int", "primary": true, "default": null },
+      { "name": "title", "type": "string", "primary": false, "default": null },
+      { "name": "attachment", "type": "string", "primary": false, "default": "" }
+    ] }
+  ],
+  "api": [
+    { "path": "/users", "model": "User", "handlers": ["list", "create"] },
+    { "path": "/users/:id", "model": "User", "handlers": ["get", "update", "delete"] },
+    { "path": "/posts", "model": "Post", "handlers": ["list", "create"] },
+    { "path": "/posts/:id", "model": "Post", "handlers": ["get", "update", "delete"] }
+  ]
+}"##;
+
+#[test]
+fn sessions_and_uploads_lower_only_when_declared() {
+    let dir = temp_dir("account");
+    let lowered =
+        lower_service(ACCOUNT_IR, &dir, &PathBuf::from("/tmp/dep-root")).expect("lowering works");
+    let main = fs::read_to_string(dir.join("src/main.rs")).expect("main.rs exists");
+    let readme = fs::read_to_string(dir.join("README.md")).expect("README exists");
+
+    // Session login/logout, gate and role ladder are all present.
+    assert!(
+        main.contains("router.route(Method::Post, \"/sessions\""),
+        "login route"
+    );
+    assert!(
+        main.contains("router.route(Method::Delete, \"/sessions\""),
+        "logout route"
+    );
+    assert!(
+        main.contains("session::login_credentials"),
+        "credential parsing"
+    );
+    assert!(
+        main.contains("session::hash_password"),
+        "digest verification"
+    );
+    assert!(main.contains("hash_registration"), "registration hashing");
+    assert!(main.contains("constant_time_eq"), "constant-time compare");
+    assert!(main.contains("sessions_enabled()"), "env opt-in");
+    assert!(
+        main.contains("session::session_gate"),
+        "session gate in the chain"
+    );
+    assert!(main.contains("Role::Admin"), "admin gate on put/delete");
+    assert!(main.contains("Role::Member"), "member gate on create");
+    assert!(
+        main.contains(
+            "fn build_router(db: PooledDb, sessions: opurom_server::session::SessionStore)"
+        ),
+        "router takes the store"
+    );
+    assert!(
+        main.contains("request.path == \"/users\""),
+        "registration path stays open"
+    );
+
+    // Uploads from the `attachment` field.
+    assert!(
+        main.contains("router.route(Method::Post, \"/uploads\""),
+        "upload route"
+    );
+    assert!(
+        main.contains("router.route(Method::Get, \"/uploads/:name\""),
+        "serve route"
+    );
+    assert!(main.contains("upload::upload_dir_from_env"), "data dir");
+    assert!(main.contains("upload::upload_response"), "store helper");
+    assert!(main.contains("upload::download_response"), "serve helper");
+
+    assert!(readme.contains("OPR_SESSION=1"), "session env documented");
+    assert!(readme.contains("OPR_DATA"), "data env documented");
+    assert!(readme.contains("POST /sessions"), "login route documented");
+    assert!(readme.contains("POST /uploads"), "upload route documented");
+
+    assert!(lowered.files.len() >= 4, "{:?}", lowered.files);
+}
+
+#[test]
+fn plain_ir_keeps_its_default_routes() {
+    // The todo IR has no account model and no attachment field: no session,
+    // no uploads, no gate - the default service shape is unchanged.
+    let dir = temp_dir("plain");
+    lower_service(IR, &dir, &PathBuf::from("/tmp/dep-root")).expect("lowering works");
+    let main = fs::read_to_string(dir.join("src/main.rs")).expect("main.rs exists");
+    let readme = fs::read_to_string(dir.join("README.md")).expect("README exists");
+
+    assert!(!main.contains("/sessions"), "no login route");
+    assert!(!main.contains("/uploads"), "no upload route");
+    assert!(!main.contains("session_gate"), "no gate");
+    assert!(!main.contains("sessions_enabled"), "no env check");
+    assert!(!main.contains("ROLE_GATE"), "no unsubstituted placeholder");
+    assert!(!main.contains("BODY_HOOK"), "no unsubstituted placeholder");
+    assert!(!readme.contains("OPR_SESSION"), "no session docs");
+    assert_eq!(
+        main.matches(".with(|guard| {").count(),
+        5,
+        "the five CRUD handlers are unchanged"
+    );
+}
