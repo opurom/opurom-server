@@ -344,3 +344,45 @@ fn plain_ir_keeps_its_default_routes() {
         "the five CRUD handlers are unchanged"
     );
 }
+
+#[test]
+fn lowering_quotes_reserved_identifiers() {
+    // `User` folds to the reserved word `user`, so the migration and every
+    // generated statement must quote it; plain names stay bare.
+    let out = temp_dir("quoted");
+    lower_service(ACCOUNT_IR, &out, &PathBuf::from("/tmp/dep-root")).expect("lowering works");
+    let migration =
+        fs::read_to_string(out.join("migrations/001_create_user.sql")).expect("migration exists");
+    assert!(
+        migration.contains("CREATE TABLE IF NOT EXISTS \"User\""),
+        "{}",
+        migration
+    );
+    assert!(
+        migration.contains("    id INTEGER PRIMARY KEY"),
+        "{}",
+        migration
+    );
+
+    let main = fs::read_to_string(out.join("src/main.rs")).expect("main.rs exists");
+    // In generated source the SQL lives inside Rust string literals, so the
+    // quotes around `User` appear escaped there.
+    assert!(
+        main.contains(r#"SELECT * FROM \"User\""#),
+        "list/login select"
+    );
+    assert!(main.contains(r#"DELETE FROM \"User\""#), "delete");
+    assert!(main.contains(r#"INSERT INTO \"User\""#), "create");
+    assert!(main.contains(r#"UPDATE \"User\" SET"#), "update");
+    assert!(
+        main.contains(r#"next_id(guard, "\"User\"""#),
+        "auto id probe"
+    );
+    // Non-keyword names keep their bare form for cross-repo assertions.
+    assert!(
+        main.contains("SELECT * FROM Post;"),
+        "plain table stays bare"
+    );
+    assert!(!main.contains(r#"FROM \"Post\""#), "no needless quoting");
+    let _ = fs::remove_dir_all(&out);
+}
