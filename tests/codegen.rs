@@ -292,9 +292,9 @@ fn sessions_and_uploads_lower_only_when_declared() {
     assert!(main.contains("Role::Member"), "member gate on create");
     assert!(
         main.contains(
-            "fn build_router(db: PooledDb, sessions: opurom_server::session::SessionStore)"
+            "fn build_router(db: PooledDb, rooms: std::sync::Arc<opurom_server::RoomHub>, sessions: opurom_server::session::SessionStore)"
         ),
-        "router takes the store"
+        "router takes the rooms and the store"
     );
     assert!(
         main.contains("request.path == \"/users\""),
@@ -400,5 +400,39 @@ fn lowering_quotes_reserved_identifiers() {
         "plain table stays bare"
     );
     assert!(!main.contains(r#"FROM \"Post\""#), "no needless quoting");
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn write_handlers_publish_change_events() {
+    let out = temp_dir("change-events");
+    lower_service(IR, &out, &PathBuf::from("/tmp/dep-root")).expect("lowering works");
+    let main = fs::read_to_string(out.join("src/main.rs")).expect("main.rs exists");
+
+    // One hub per service: the router publishes, the server delivers.
+    assert!(
+        main.contains("let rooms = std::sync::Arc::new(opurom_server::RoomHub::default());"),
+        "hub created"
+    );
+    assert!(
+        main.contains("build_router(pool, rooms.clone())"),
+        "hub to router"
+    );
+    assert!(main.contains("server.with_rooms(rooms)"), "hub to server");
+    assert!(
+        main.contains("fn change_id(value: &DbValue) -> Json"),
+        "id encoding"
+    );
+
+    // One event per write, after the database accepts it; reads stay silent.
+    for op in ["insert", "update", "delete"] {
+        assert!(
+            main.contains(&format!(
+                "publish_change(\"Todo\", \"{op}\", &change_id(&id_value))"
+            )),
+            "{op} publishes"
+        );
+    }
+    assert_eq!(main.matches("publish_change(").count(), 3, "writes only");
     let _ = fs::remove_dir_all(&out);
 }

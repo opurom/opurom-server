@@ -224,6 +224,12 @@ impl Server {
         self
     }
 
+    /// Share a prebuilt room hub with write handlers that publish changes.
+    pub fn with_rooms(mut self, rooms: Arc<RoomHub>) -> Server {
+        self.rooms = rooms;
+        self
+    }
+
     /// Enable HTTP/1.1 keep-alive on this server.
     pub fn with_keep_alive(mut self) -> Server {
         self.keep_alive = true;
@@ -842,12 +848,59 @@ struct HubState {
 }
 
 #[derive(Default)]
-struct RoomHub {
+pub struct RoomHub {
     state: Mutex<HubState>,
     next_id: AtomicU64,
 }
 
 impl RoomHub {
+    /// Publish one data-change event to the subscribers of `model`.
+    ///
+    /// One write emits exactly one event; events keep write completion order.
+    /// A model with no subscribers costs one membership lookup and no frames.
+    pub fn publish_change(&self, model: &str, op: &str, id: &Value) -> usize {
+        if !matches!(op, "insert" | "update" | "delete")
+            || rooms::validate_room_name(model).is_err()
+        {
+            return 0;
+        }
+        let mut state = lock(&self.state);
+        let recipients = match state.rooms.members(model) {
+            Ok(members) => members,
+            Err(_) => return 0,
+        };
+        if recipients.is_empty() {
+            return 0;
+        }
+        let body = json!({
+            "type": "change",
+            "model": model,
+            "op": op,
+            "id": id,
+        })
+        .to_string();
+        if body.len() > websocket::MAX_FRAME_PAYLOAD {
+            return 0;
+        }
+        let frame = websocket::encode_frame(websocket::Opcode::Text, body.as_bytes(), true, None);
+        self.deliver(&mut state, recipients, frame)
+    }
+
+    fn deliver(&self, state: &mut HubState, recipients: Vec<ClientId>, frame: Vec<u8>) -> usize {
+        let mut delivered = 0;
+        let mut broken = Vec::new();
+        for id in recipients {
+            match state.senders.get(&id) {
+                Some(sender) if sender.send(frame.clone()).is_ok() => delivered += 1,
+                _ => broken.push(id),
+            }
+        }
+        for id in broken {
+            state.senders.remove(&id);
+            state.rooms.leave_all(&id);
+        }
+        delivered
+    }
     fn register(&self) -> (ClientId, mpsc::Receiver<OutboundFrame>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (sender, receiver) = mpsc::channel();
@@ -892,23 +945,16 @@ impl RoomHub {
         let frame = websocket::encode_frame(websocket::Opcode::Text, body.as_bytes(), true, None);
         let mut state = lock(&self.state);
         let recipients = state.rooms.broadcast(room).map_err(ControlError::room)?;
-        let mut delivered = 0;
-        let mut broken = Vec::new();
-        for id in recipients {
-            match state.senders.get(&id) {
-                Some(sender) if sender.send(frame.clone()).is_ok() => delivered += 1,
-                _ => broken.push(id),
-            }
-        }
-        for id in broken {
-            state.senders.remove(&id);
-            state.rooms.leave_all(&id);
-        }
-        Ok(delivered)
+        Ok(self.deliver(&mut state, recipients, frame))
     }
 
     fn send_ack(&self, id: ClientId, kind: &str, room: &str) {
         let body = json!({ "type": kind, "room": room }).to_string();
+        self.send_frame(id, &body);
+    }
+
+    fn send_subscribed(&self, id: ClientId, model: &str) {
+        let body = json!({ "type": "subscribed", "model": model }).to_string();
         self.send_frame(id, &body);
     }
 
@@ -962,15 +1008,19 @@ impl ControlError {
 enum Control {
     Join { room: String },
     Leave { room: String },
+    Subscribe { model: String },
     Broadcast { room: String, payload: Value },
 }
 
-fn control_room(object: &serde_json::Map<String, Value>) -> Result<String, ControlError> {
+fn control_field(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<String, ControlError> {
     object
-        .get("room")
+        .get(key)
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| ControlError::invalid("room must be a string"))
+        .ok_or_else(|| ControlError::invalid(format!("{key} must be a string")))
 }
 
 /// Parse a JSON control object. Other text remains an ordinary echo message.
@@ -987,10 +1037,13 @@ fn parse_control(text: &str) -> Result<Option<Control>, ControlError> {
     let Some(kind) = kind.as_str() else {
         return Err(ControlError::invalid("type must be a string"));
     };
-    let room = || control_room(object);
+    let room = || control_field(object, "room");
     match kind {
         "join" => Ok(Some(Control::Join { room: room()? })),
         "leave" => Ok(Some(Control::Leave { room: room()? })),
+        "subscribe" => Ok(Some(Control::Subscribe {
+            model: control_field(object, "model")?,
+        })),
         "broadcast" => {
             let payload = object
                 .get("payload")
@@ -1020,6 +1073,10 @@ fn handle_control(rooms: &RoomHub, id: ClientId, control: Control) {
         },
         Control::Leave { room } => match rooms.leave(id, &room) {
             Ok(()) => rooms.send_ack(id, "left", &room),
+            Err(error) => rooms.send_error(id, &ControlError::room(error)),
+        },
+        Control::Subscribe { model } => match rooms.join(id, &model) {
+            Ok(()) => rooms.send_subscribed(id, &model),
             Err(error) => rooms.send_error(id, &ControlError::room(error)),
         },
         Control::Broadcast { room, payload } => {

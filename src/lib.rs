@@ -75,7 +75,8 @@ pub use rooms::{
 };
 pub use router::{RegisteredRoute, Router};
 pub use server::{
-    Server, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, KEEP_ALIVE_ENV, TLS_ENV, WEBSOCKET_ENV,
+    RoomHub, Server, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, KEEP_ALIVE_ENV, TLS_ENV,
+    WEBSOCKET_ENV,
 };
 pub use session::{
     clear_session_cookie, cookie_value, default_protected, ids_equal, require_role, session_cookie,

@@ -405,6 +405,15 @@ fn next_id(db: &mut Sqlite, table: &str, primary: &str) -> DbValue {
     }
 }
 
+#[allow(dead_code)]
+fn change_id(value: &DbValue) -> Json {
+    match value {
+        DbValue::Int(number) => Json::from(*number),
+        DbValue::Text(text) => Json::String(text.clone()),
+        DbValue::Bool(flag) => Json::Bool(*flag),
+    }
+}
+
 "#;
 
 /// Router construction.
@@ -497,10 +506,12 @@ fn upload_routes(has_account: bool) -> String {
 /// The router builder; the sessions parameter appears only when the IR
 /// declares an account model, so other services keep their exact signature.
 fn router_build(session: bool) -> String {
+    let base =
+        "fn build_router(db: PooledDb, rooms: std::sync::Arc<opurom_server::RoomHub>) -> Router {";
     if session {
         ROUTER_BUILD.replace(
-            "fn build_router(db: PooledDb) -> Router {",
-            "fn build_router(db: PooledDb, sessions: opurom_server::session::SessionStore) -> Router {",
+            base,
+            "fn build_router(db: PooledDb, rooms: std::sync::Arc<opurom_server::RoomHub>, sessions: opurom_server::session::SessionStore) -> Router {",
         )
     } else {
         ROUTER_BUILD.to_string()
@@ -510,22 +521,31 @@ fn router_build(session: bool) -> String {
 /// The generated `main`; the session store and the gate join the chain only
 /// for an IR with an account model.
 fn main_fn(session: bool) -> String {
-    let text = MAIN_FN.to_string();
-    if !session {
-        return text;
+    let mut text = MAIN_FN
+        .replace(
+            "    let mut router = build_router(pool);",
+            "    let rooms = std::sync::Arc::new(opurom_server::RoomHub::default());\n    let mut router = build_router(pool, rooms.clone());",
+        )
+        .replace(
+            "    };\n    match server.tls_config() {",
+            "    };\n    let server = server.with_rooms(rooms);\n    match server.tls_config() {",
+        );
+    if session {
+        text = text
+            .replace(
+                "    let mut router = build_router(pool, rooms.clone());",
+                "    let sessions = opurom_server::session::SessionStore::default();\n    let mut router = build_router(pool, rooms.clone(), sessions.clone());",
+            )
+            .replace(
+                "    chain.push(body_cap(1024 * 1024));",
+                "    chain.push(body_cap(1024 * 1024));\n    if opurom_server::session::sessions_enabled() {\n        chain.push(opurom_server::session::session_gate(sessions.clone(), protected));\n    }",
+            );
     }
-    text.replace(
-        "    let mut router = build_router(pool);",
-        "    let sessions = opurom_server::session::SessionStore::default();\n    let mut router = build_router(pool, sessions.clone());",
-    )
-    .replace(
-        "    chain.push(body_cap(1024 * 1024));",
-        "    chain.push(body_cap(1024 * 1024));\n    if opurom_server::session::sessions_enabled() {\n        chain.push(opurom_server::session::session_gate(sessions.clone(), protected));\n    }",
-    )
+    text
 }
 
 const ROUTER_BUILD: &str = r#"#[allow(unused_variables)]
-fn build_router(db: PooledDb) -> Router {
+fn build_router(db: PooledDb, rooms: std::sync::Arc<opurom_server::RoomHub>) -> Router {
     let mut router = Router::new();
     router.route(Method::Get, "/health", |_request: &mut Request| {
         Response::json_text(
@@ -645,6 +665,7 @@ const GET_HANDLER: &str = r#"    let get_db = db.clone();
 "#;
 
 const CREATE_HANDLER: &str = r#"    let create_db = db.clone();
+    let create_rooms = rooms.clone();
     router.route(Method::Post, "{{PATH}}", move |request: &mut Request| {
 {{ROLE_GATE}}        create_db.with(|guard| {
         let body = match request.json() {
@@ -663,6 +684,7 @@ const CREATE_HANDLER: &str = r#"    let create_db = db.clone();
         if let Err(err) = guard.exec_params(&sql, &values) {
             return Response::error(500, &format!("database_error: {}", err));
         }
+        create_rooms.publish_change("{{MODEL_NAME}}", "insert", &change_id(&id_value));
         match guard.query_params("{{SQL_SELECT}}", &[id_value]) {
             Ok(rows) => match rows.first() {
                 Some(row) => Response::json_text(201, &row_to_json({{MODEL}}, row)),
@@ -675,6 +697,7 @@ const CREATE_HANDLER: &str = r#"    let create_db = db.clone();
 "#;
 
 const UPDATE_HANDLER: &str = r#"    let update_db = db.clone();
+    let update_rooms = rooms.clone();
     router.route(Method::Put, "{{PATH}}", move |request: &mut Request| {
 {{ROLE_GATE}}        update_db.with(|guard| {
         let raw_id = request.param("{{PARAM}}").unwrap_or_default().to_string();
@@ -699,6 +722,7 @@ const UPDATE_HANDLER: &str = r#"    let update_db = db.clone();
             if let Err(err) = guard.exec_params(&sql, &values) {
                 return Response::error(500, &format!("database_error: {}", err));
             }
+            update_rooms.publish_change("{{MODEL_NAME}}", "update", &change_id(&id_value));
         }
         match guard.query_params("{{SQL_SELECT}}", &[id_value]) {
             Ok(rows) => match rows.first() {
@@ -712,6 +736,7 @@ const UPDATE_HANDLER: &str = r#"    let update_db = db.clone();
 "#;
 
 const DELETE_HANDLER: &str = r#"    let delete_db = db.clone();
+    let delete_rooms = rooms.clone();
     router.route(Method::Delete, "{{PATH}}", move |request: &mut Request| {
 {{ROLE_GATE}}        delete_db.with(|guard| {
         let raw_id = request.param("{{PARAM}}").unwrap_or_default().to_string();
@@ -724,9 +749,10 @@ const DELETE_HANDLER: &str = r#"    let delete_db = db.clone();
                 if rows.is_empty() {
                     return Response::error(404, "not_found");
                 }
-                if let Err(err) = guard.exec_params("{{SQL_DELETE}}", &[id_value]) {
+                if let Err(err) = guard.exec_params("{{SQL_DELETE}}", &[id_value.clone()]) {
                     return Response::error(500, &format!("database_error: {}", err));
                 }
+                delete_rooms.publish_change("{{MODEL_NAME}}", "delete", &change_id(&id_value));
                 Response::json_text(200, "{\"deleted\":true}")
             }
             Err(err) => Response::error(500, &format!("database_error: {}", err)),
@@ -835,6 +861,7 @@ fn handlers_for(ir: &Ir, api: &Api) -> String {
             ("PATH", api.path.as_str()),
             ("TABLE", table.as_str()),
             ("MODEL", model_const.as_str()),
+            ("MODEL_NAME", model.name.as_str()),
             ("PRIMARY", primary_sql.as_str()),
             ("PARAM", param),
             ("SQL", list_sql.as_str()),
