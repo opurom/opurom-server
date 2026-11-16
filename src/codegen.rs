@@ -223,6 +223,28 @@ fn main_rs(ir: &Ir) -> String {
         out.push_str("    ],\n};\n\n");
     }
 
+    // A password-free serialization def for the account model: the create,
+    // list and get handlers answer rows through it, so no digest is sent.
+    if let Some(account) = account_model(ir) {
+        let _ = writeln!(
+            out,
+            "const MODEL_{}_PUB: &ModelDef = &ModelDef {{\n    fields: &[",
+            const_ident(&account.name)
+        );
+        for field in &account.fields {
+            if field.name == "password" {
+                continue;
+            }
+            let _ = writeln!(
+                out,
+                "        ({:?}, FieldType::{}),",
+                field.name,
+                field_type_variant(&field.ty)
+            );
+        }
+        out.push_str("    ],\n};\n\n");
+    }
+
     // Embedded migrations: executed at startup.
     out.push_str("const MIGRATIONS: &[(&str, &str)] = &[\n");
     for (index, model) in ir.models.iter().enumerate() {
@@ -761,7 +783,14 @@ fn handlers_for(ir: &Ir, api: &Api) -> String {
         Some(model) => model,
         None => return String::new(),
     };
-    let model_const = format!("MODEL_{}", const_ident(&model.name));
+    // The account model never serializes its password column: responses use a
+    // password-free ModelDef so no digest reaches a client.
+    let serial_model = account_model(ir).is_some_and(|found| found.name == model.name);
+    let model_const = if serial_model {
+        format!("MODEL_{}_PUB", const_ident(&model.name))
+    } else {
+        format!("MODEL_{}", const_ident(&model.name))
+    };
     let primary = model
         .primary()
         .map(|field| field.name.clone())

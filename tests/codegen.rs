@@ -319,6 +319,22 @@ fn sessions_and_uploads_lower_only_when_declared() {
     assert!(readme.contains("POST /sessions"), "login route documented");
     assert!(readme.contains("POST /uploads"), "upload route documented");
 
+    // The account model serializes through a password-free def: no digest in
+    // any row response.
+    assert!(main.contains("const MODEL_USER_PUB"), "pub def emitted");
+    assert!(
+        main.contains("row_to_json(MODEL_USER_PUB"),
+        "handlers serialize without the password column"
+    );
+    let pub_block = main
+        .split("const MODEL_USER_PUB")
+        .nth(1)
+        .expect("pub def block")
+        .split("};")
+        .next()
+        .expect("def body");
+    assert!(!pub_block.contains("password"), "digest column omitted");
+
     assert!(lowered.files.len() >= 4, "{:?}", lowered.files);
 }
 
