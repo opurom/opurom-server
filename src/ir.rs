@@ -140,6 +140,10 @@ pub struct Ir {
     pub app: String,
     pub state: Vec<StateVar>,
     pub tree: Option<Value>,
+    /// Multi-page IR: route name -> `{title, tree}` entries.
+    pub routes: Option<Value>,
+    /// Route rendered first when `tree` is absent.
+    pub initial_route: Option<String>,
     pub theme: Theme,
     pub models: Vec<Model>,
     pub api: Vec<Api>,
@@ -187,6 +191,11 @@ impl Ir {
         }
 
         let tree = root.get("tree").cloned();
+        let routes = root.get("routes").cloned();
+        let initial_route = root
+            .get("initialRoute")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let theme = root
             .get("theme")
             .and_then(Theme::from_json)
@@ -279,10 +288,23 @@ impl Ir {
             app,
             state,
             tree,
+            routes,
+            initial_route,
             theme,
             models,
             api,
         })
+    }
+
+    /// The tree SSR renders first: the single-page `tree`, otherwise the
+    /// `initialRoute` entry of a multi-page `routes` table.
+    pub fn initial_tree(&self) -> Option<&Value> {
+        if let Some(tree) = &self.tree {
+            return Some(tree);
+        }
+        let routes = self.routes.as_ref()?.as_object()?;
+        let name = self.initial_route.as_deref()?;
+        routes.get(name)?.get("tree")
     }
 
     /// Look up a model by name.

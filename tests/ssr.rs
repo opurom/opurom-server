@@ -104,3 +104,31 @@ fn ir_parses_models_and_api() {
     assert_eq!(ir.api.len(), 1);
     assert_eq!(ir.api[0].handlers, vec!["list", "create"]);
 }
+
+#[test]
+fn multi_page_ir_renders_the_initial_route() {
+    let multi = r##"{
+      "ir": "0.1.0",
+      "app": "TeamHub",
+      "state": [],
+      "initialRoute": "Overview",
+      "routes": {
+        "Overview": { "title": "Overview", "tree": {
+          "id": 0, "kind": "Column", "props": {}, "events": {},
+          "children": [ { "id": 1, "kind": "Text",
+            "props": { "value": "Overview body" }, "children": [], "events": {} } ]
+        } },
+        "Team": { "title": "Team", "tree": {
+          "id": 2, "kind": "Column", "props": {}, "events": {},
+          "children": [ { "id": 3, "kind": "Text",
+            "props": { "value": "Team body" }, "children": [], "events": {} } ]
+        } }
+      },
+      "theme": { "mode": "system", "accent": "#097FEB", "radius": 12 }
+    }"##;
+    let html = ssr_html(multi, "");
+    assert!(html.contains("Overview body"), "{}", html);
+    assert!(!html.contains("Team body"), "{}", html);
+    let ir = Ir::parse(multi).expect("multi-page IR parses");
+    assert!(ir.initial_tree().is_some());
+}

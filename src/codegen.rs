@@ -827,6 +827,12 @@ fn ir_json_const(ir: &Ir) -> String {
     if let Some(tree) = &ir.tree {
         root.insert("tree".to_string(), tree.clone());
     }
+    if let Some(routes) = &ir.routes {
+        root.insert("routes".to_string(), routes.clone());
+    }
+    if let Some(route) = &ir.initial_route {
+        root.insert("initialRoute".to_string(), Value::String(route.clone()));
+    }
     let mut theme = serde_json::Map::new();
     theme.insert("mode".to_string(), Value::String(ir.theme.mode.clone()));
     theme.insert("accent".to_string(), Value::String(ir.theme.accent.clone()));

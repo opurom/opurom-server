@@ -118,7 +118,7 @@ pub fn render(ir: &Ir, theme: &Theme) -> String {
         escape_html(&ir.app)
     )
     .ok();
-    if let Some(tree) = &ir.tree {
+    if let Some(tree) = ir.initial_tree() {
         render_node(tree, &state, theme, &mut html, 1);
     }
     html.push_str("</main>\n</body>\n</html>\n");
