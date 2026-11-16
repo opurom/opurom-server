@@ -117,6 +117,14 @@ impl Response {
         self.headers.push((name.to_string(), value.to_string()));
     }
 
+    /// Case-insensitive header lookup.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
     /// JSON response with `Content-Type: application/json`.
     pub fn json(status: u16, value: &Value) -> Response {
         let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());

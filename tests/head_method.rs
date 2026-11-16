@@ -47,11 +47,10 @@ fn head_keeps_get_only_routes_and_unknown_paths_unchanged() {
         404,
         "an unknown path stays 404 for HEAD"
     );
-    assert_eq!(
-        body_of(&router, Method::Post, "/health").status,
-        405,
-        "a POST on a GET route stays 405"
-    );
+    let not_allowed = body_of(&router, Method::Post, "/health");
+    assert_eq!(not_allowed.status, 405, "a POST on a GET route stays 405");
+    // HEAD serves beside GET, so the Allow header lists both.
+    assert_eq!(not_allowed.header("Allow"), Some("GET, HEAD"));
 }
 
 #[test]

@@ -217,11 +217,45 @@ impl Router {
             };
         }
         if path_matched {
-            Response::error(405, "method_not_allowed")
+            let mut response = Response::error(405, "method_not_allowed");
+            response.set_header("Allow", &allowed_methods(&self.routes, &request.path));
+            response
         } else {
             Response::error(404, "not_found")
         }
     }
+}
+
+/// The `Allow` set of a known path: every registered method of every matching
+/// route, with `HEAD` listed beside the `GET` that serves it, in a fixed
+/// order so generated services and runtime adapters agree byte for byte.
+fn allowed_methods(routes: &[Route], path: &str) -> String {
+    let mut registered: Vec<&Method> = Vec::new();
+    for route in routes {
+        if route.matches(path).is_some()
+            && !registered.iter().any(|method| **method == route.method)
+        {
+            registered.push(&route.method);
+        }
+    }
+    if registered.iter().any(|method| **method == Method::Get)
+        && !registered.iter().any(|method| **method == Method::Head)
+    {
+        registered.push(&Method::Head);
+    }
+    registered.sort_by_key(|method| match method {
+        Method::Get => 0,
+        Method::Head => 1,
+        Method::Post => 2,
+        Method::Put => 3,
+        Method::Delete => 4,
+        Method::Other(_) => 5,
+    });
+    registered
+        .iter()
+        .map(|method| method.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// True when a registered route method answers the request method. A `HEAD`

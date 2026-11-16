@@ -736,6 +736,7 @@ fn cors_wildcard_is_literal_and_invalid_config_is_disabled() {
     ));
     assert_eq!(preflight.status(), 405);
     assert_eq!(preflight.header("Access-Control-Allow-Methods"), None);
+    assert_eq!(preflight.header("Allow"), Some("GET, HEAD"));
     assert_eq!(preflight.body_str(), "{\"error\":\"method_not_allowed\"}");
 }
 
@@ -922,6 +923,7 @@ fn default_behaviour_is_byte_identical_without_http_env() {
     assert_eq!(options.status(), 405);
     assert_eq!(options.header("Access-Control-Allow-Origin"), None);
     assert_eq!(options.header("ETag"), None);
+    assert_eq!(options.header("Allow"), Some("GET, HEAD"));
     assert_eq!(options.body_str(), "{\"error\":\"method_not_allowed\"}");
 
     server.wait_for_plain_lines(2);

@@ -15,6 +15,7 @@ use opurom_server::server::Server;
 struct Answer {
     status: u16,
     body: String,
+    allow: Option<String>,
 }
 
 /// Start a server on an ephemeral port with the given router.
@@ -51,9 +52,14 @@ fn request(port: u16, method: &str, path: &str, body: &str) -> Answer {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or(0);
+    let allow = head
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("allow:"))
+        .map(|line| line["Allow:".len()..].trim().to_string());
     Answer {
         status,
         body: body.to_string(),
+        allow,
     }
 }
 
@@ -227,6 +233,27 @@ fn wrong_method_is_405_json() {
     let answer = request(port, "PUT", "/todos", "{}");
     assert_eq!(answer.status, 405);
     assert_eq!(answer.body, "{\"error\":\"method_not_allowed\"}");
+    // HEAD rides beside GET, so the collection answers GET, HEAD, POST.
+    assert_eq!(answer.allow.as_deref(), Some("GET, HEAD, POST"));
+    shutdown.store(true, Ordering::Relaxed);
+}
+
+#[test]
+fn the_405_allow_header_lists_every_registered_method() {
+    let (port, shutdown) = start(crud_router());
+    // /todos/:id registers GET, PUT and DELETE; HEAD joins GET and the fixed
+    // order keeps generated services and runtime adapters byte-identical.
+    let answer = request(port, "POST", "/todos/1", "{}");
+    assert_eq!(answer.status, 405);
+    assert_eq!(answer.allow.as_deref(), Some("GET, HEAD, PUT, DELETE"));
+    // An unregistered custom method still names the served set.
+    let answer = request(port, "PATCH", "/health", "");
+    assert_eq!(answer.status, 405);
+    assert_eq!(answer.allow.as_deref(), Some("GET, HEAD"));
+    // A 404 names no methods.
+    let answer = request(port, "GET", "/does-not-exist", "");
+    assert_eq!(answer.status, 404);
+    assert_eq!(answer.allow, None);
     shutdown.store(true, Ordering::Relaxed);
 }
 
