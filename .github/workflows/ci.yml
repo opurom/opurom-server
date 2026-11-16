@@ -79,17 +79,69 @@ jobs:
       - name: Run ${{ matrix.check }}
         run: node .github/scripts/ci-check.mjs ${{ matrix.check }}
 
+  # Live PostgreSQL gate: the DDL lowering writes must parse against a real
+  # server, not only inside unit tests. A SKIP line would fake a green run,
+  # so this job rejects it explicitly, like the database crate's own gate.
+  postgres-schema:
+    name: postgres-schema
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: opurom_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      OPUROM_TEST_PG: '1'
+      OPUROM_TEST_PG_HOST: 127.0.0.1
+      OPUROM_TEST_PG_PORT: '5432'
+      OPUROM_TEST_PG_USER: postgres
+      OPUROM_TEST_PG_DB: opurom_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install libsqlite3-dev
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      # The dev-dependency and codegen workspace discovery resolve
+      # ../opurom-db, the same sibling the main check already clones.
+      - name: Checkout the sibling database crate
+        run: git clone --depth 1 "https://github.com/opurom/opurom-db.git" "$GITHUB_WORKSPACE/../opurom-db"
+      - name: Run the live schema suite
+        run: |
+          set +e
+          out="$(cargo test --test pg_schema -- --nocapture 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$out"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          if printf '%s\n' "$out" | grep -q "SKIP:"; then
+            echo "::error::live PostgreSQL schema check skipped"
+            exit 1
+          fi
+
   # One ping per push, after every matrix check finished green on main. The
   # train recomputes its own gate, so this is only a wake-up call, not a
   # verdict. A ping failure never turns CI red.
   ci-green:
     name: notify release train
-    needs: check
+    needs: [check, postgres-schema]
     if: >-
       ${{
         always() &&
         github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-        needs.check.result == 'success' && github.repository_owner == 'opurom' &&
+        needs.check.result == 'success' &&
+        needs.postgres-schema.result == 'success' &&
+        github.repository_owner == 'opurom' &&
         github.event.repository.name != 'opurom-ui' &&
         github.event.repository.name != 'opurom-icons' &&
         github.event.repository.name != 'opurom-examples'
