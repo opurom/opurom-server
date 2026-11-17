@@ -21,13 +21,13 @@
 //! uses integer ticks injected from a monotonic source, recycles released
 //! slots in FIFO order and rejects a full pool with a fixed 503 answer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::pool::Lease;
 pub use crate::pool::{
@@ -841,10 +841,94 @@ type OutboundFrame = Vec<u8>;
 
 const WS_READ_TIMEOUT: Duration = Duration::from_millis(10);
 
+/// Bounded outbound frames per subscriber. One slot stays spare so an
+/// overflow can report the drop before the newest change is delivered.
+const MAX_CLIENT_FRAMES: usize = 32;
+
+#[derive(Default)]
+struct ClientQueue {
+    frames: Mutex<VecDeque<OutboundFrame>>,
+    wake: Condvar,
+    closed: AtomicBool,
+}
+
+impl ClientQueue {
+    /// Block until one frame is ready, or the client is deregistered.
+    fn next(&self) -> Option<OutboundFrame> {
+        let mut frames = lock(&self.frames);
+        loop {
+            if let Some(frame) = frames.pop_front() {
+                return Some(frame);
+            }
+            if self.closed.load(Ordering::Relaxed) {
+                return None;
+            }
+            frames = self
+                .wake
+                .wait(frames)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Drop the oldest frames until a change and a possible error both fit.
+    /// Returns the number of frames dropped, or an error when even an empty
+    /// queue cannot hold them (then the client must be deregistered).
+    fn push_change(&self, change: OutboundFrame, room: &str) -> Result<usize, usize> {
+        let mut frames = lock(&self.frames);
+        let mut dropped = 0;
+        while frames.len() + 2 > MAX_CLIENT_FRAMES {
+            if frames.pop_front().is_none() {
+                break;
+            }
+            dropped += 1;
+        }
+        if frames.len() + 2 > MAX_CLIENT_FRAMES {
+            return Err(dropped);
+        }
+        if dropped > 0 {
+            let body = json!({
+                "code": "queue_overflow",
+                "dropped": dropped,
+                "room": room,
+                "type": "error",
+            })
+            .to_string();
+            frames.push_back(websocket::encode_frame(
+                websocket::Opcode::Text,
+                body.as_bytes(),
+                true,
+                None,
+            ));
+        }
+        frames.push_back(change);
+        self.wake.notify_one();
+        Ok(dropped)
+    }
+
+    /// Enqueue an acknowledgement or control error, dropping one old frame
+    /// at a time when full. Control frames never emit an error frame.
+    fn push_other(&self, frame: OutboundFrame) -> Result<usize, usize> {
+        let mut frames = lock(&self.frames);
+        let mut dropped = 0;
+        while frames.len() >= MAX_CLIENT_FRAMES {
+            frames.pop_front();
+            dropped += 1;
+        }
+        frames.push_back(frame);
+        self.wake.notify_one();
+        Ok(dropped)
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        self.wake.notify_all();
+    }
+}
+
 #[derive(Default)]
 struct HubState {
     rooms: RoomRegistry<ClientId>,
-    senders: BTreeMap<ClientId, mpsc::Sender<OutboundFrame>>,
+    senders: BTreeMap<ClientId, Arc<ClientQueue>>,
 }
 
 #[derive(Default)]
@@ -859,9 +943,12 @@ impl RoomHub {
     /// One write emits exactly one event; events keep write completion order.
     /// A model with no subscribers costs one membership lookup and no frames.
     pub fn publish_change(&self, model: &str, op: &str, id: &Value) -> usize {
-        if !matches!(op, "insert" | "update" | "delete")
-            || rooms::validate_room_name(model).is_err()
-        {
+        if !matches!(op, "insert" | "update" | "delete") {
+            self.report(None, model, 0, "invalid_op");
+            return 0;
+        }
+        if rooms::validate_room_name(model).is_err() {
+            self.report(None, model, 0, "invalid_room");
             return 0;
         }
         let mut state = lock(&self.state);
@@ -880,39 +967,86 @@ impl RoomHub {
         })
         .to_string();
         if body.len() > websocket::MAX_FRAME_PAYLOAD {
+            self.report(None, model, body.len(), "frame_too_large");
             return 0;
         }
         let frame = websocket::encode_frame(websocket::Opcode::Text, body.as_bytes(), true, None);
-        self.deliver(&mut state, recipients, frame)
+        self.deliver(&mut state, recipients, frame, model)
     }
 
-    fn deliver(&self, state: &mut HubState, recipients: Vec<ClientId>, frame: Vec<u8>) -> usize {
+    /// One structured stderr line per publish or delivery failure. Wall-clock
+    /// time is operational only: no event frame ever carries it.
+    fn report(
+        &self,
+        client: Option<ClientId>,
+        room: &str,
+        frame_bytes: usize,
+        reason: &'static str,
+    ) {
+        let time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        eprintln!(
+            "{}",
+            json!({
+                "client": client,
+                "frame_bytes": frame_bytes,
+                "reason": reason,
+                "room": room,
+                "time_ms": time_ms,
+            })
+        );
+    }
+
+    fn deliver(
+        &self,
+        state: &mut HubState,
+        recipients: Vec<ClientId>,
+        frame: Vec<u8>,
+        room: &str,
+    ) -> usize {
         let mut delivered = 0;
         let mut broken = Vec::new();
         for id in recipients {
-            match state.senders.get(&id) {
-                Some(sender) if sender.send(frame.clone()).is_ok() => delivered += 1,
-                _ => broken.push(id),
+            let Some(queue) = state.senders.get(&id).cloned() else {
+                broken.push(id);
+                continue;
+            };
+            match queue.push_change(frame.clone(), room) {
+                Ok(dropped) => {
+                    if dropped > 0 {
+                        self.report(Some(id), room, frame.len(), "queue_overflow");
+                    }
+                    delivered += 1;
+                }
+                Err(_) => broken.push(id),
             }
         }
         for id in broken {
-            state.senders.remove(&id);
-            state.rooms.leave_all(&id);
+            self.drop_client(state, id);
         }
         delivered
     }
-    fn register(&self) -> (ClientId, mpsc::Receiver<OutboundFrame>) {
+
+    fn drop_client(&self, state: &mut HubState, id: ClientId) {
+        if let Some(queue) = state.senders.remove(&id) {
+            queue.close();
+        }
+        state.rooms.leave_all(&id);
+    }
+
+    fn register(&self) -> (ClientId, Arc<ClientQueue>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let (sender, receiver) = mpsc::channel();
+        let queue = Arc::new(ClientQueue::default());
         let mut state = lock(&self.state);
-        state.senders.insert(id, sender);
-        (id, receiver)
+        state.senders.insert(id, Arc::clone(&queue));
+        (id, queue)
     }
 
     fn deregister(&self, id: ClientId) {
         let mut state = lock(&self.state);
-        state.rooms.leave_all(&id);
-        state.senders.remove(&id);
+        self.drop_client(&mut state, id);
     }
 
     fn join(&self, id: ClientId, room: &str) -> Result<(), RoomError> {
@@ -945,7 +1079,7 @@ impl RoomHub {
         let frame = websocket::encode_frame(websocket::Opcode::Text, body.as_bytes(), true, None);
         let mut state = lock(&self.state);
         let recipients = state.rooms.broadcast(room).map_err(ControlError::room)?;
-        Ok(self.deliver(&mut state, recipients, frame))
+        Ok(self.deliver(&mut state, recipients, frame, room))
     }
 
     fn send_ack(&self, id: ClientId, kind: &str, room: &str) {
@@ -970,14 +1104,16 @@ impl RoomHub {
 
     fn send_frame(&self, id: ClientId, body: &str) {
         let frame = websocket::encode_frame(websocket::Opcode::Text, body.as_bytes(), true, None);
-        let mut state = lock(&self.state);
-        let broken = match state.senders.get(&id) {
-            Some(sender) => sender.send(frame).is_err(),
-            None => true,
+        let queue = {
+            let state = lock(&self.state);
+            state.senders.get(&id).cloned()
         };
-        if broken {
-            state.senders.remove(&id);
-            state.rooms.leave_all(&id);
+        let Some(queue) = queue else {
+            return;
+        };
+        if queue.push_other(frame).is_err() {
+            let mut state = lock(&self.state);
+            self.drop_client(&mut state, id);
         }
     }
 }
@@ -1149,7 +1285,7 @@ fn serve_websocket(
     let (id, outbound) = rooms.register();
     let mut writer = shared.clone();
     thread::spawn(move || {
-        while let Ok(frame) = outbound.recv() {
+        while let Some(frame) = outbound.next() {
             if writer.write_all(&frame).is_err() || writer.flush().is_err() {
                 break;
             }
@@ -1195,5 +1331,59 @@ pub fn request_for(method: crate::http::Method, path: &str, body: &str) -> Reque
         body: body.as_bytes().to_vec(),
         params: BTreeMap::new(),
         version: "HTTP/1.1".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod change_queue_tests {
+    use super::{websocket, ClientQueue, MAX_CLIENT_FRAMES};
+
+    fn text(frame: &[u8]) -> String {
+        let parsed = websocket::read_frame(&mut &frame[..], false).expect("valid frame");
+        String::from_utf8(parsed.payload).expect("utf8 payload")
+    }
+
+    fn overflow_run() -> Vec<String> {
+        let queue = ClientQueue::default();
+        for id in 0..(MAX_CLIENT_FRAMES * 2) {
+            let change = websocket::encode_frame(
+                websocket::Opcode::Text,
+                format!("{{\"id\":{id}}}").as_bytes(),
+                true,
+                None,
+            );
+            queue.push_change(change, "Todo").expect("queue fits");
+        }
+        queue.close();
+        let mut frames = Vec::new();
+        while let Some(frame) = queue.next() {
+            frames.push(text(&frame));
+        }
+        frames
+    }
+
+    #[test]
+    fn overflow_drops_oldest_and_reports_once_per_change() {
+        let first = overflow_run();
+        let second = overflow_run();
+        assert_eq!(first, second, "two runs emit identical bytes");
+        assert!(first.len() <= MAX_CLIENT_FRAMES, "bounded queue");
+        assert!(
+            first.last().is_some_and(|last| last.contains("\"id\":63")),
+            "newest wins"
+        );
+        let errors: std::collections::BTreeSet<_> = first
+            .iter()
+            .filter(|frame| frame.contains("\"type\":\"error\""))
+            .cloned()
+            .collect();
+        assert_eq!(
+            errors,
+            std::collections::BTreeSet::from([
+                "{\"code\":\"queue_overflow\",\"dropped\":2,\"room\":\"Todo\",\"type\":\"error\"}"
+                    .to_string()
+            ]),
+            "steady overflow bytes are fixed"
+        );
     }
 }
