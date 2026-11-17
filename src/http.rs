@@ -113,8 +113,21 @@ impl Response {
         self
     }
 
+    /// Set a header. A repeated name keeps one entry: the values are joined
+    /// with `, `, the same rule the Dart shelf `Headers` map applies to
+    /// multi-valued headers.
     pub fn set_header(&mut self, name: &str, value: &str) {
-        self.headers.push((name.to_string(), value.to_string()));
+        match self
+            .headers
+            .iter_mut()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        {
+            Some((_, current)) => {
+                current.push_str(", ");
+                current.push_str(value);
+            }
+            None => self.headers.push((name.to_string(), value.to_string())),
+        }
     }
 
     /// Case-insensitive header lookup.

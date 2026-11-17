@@ -228,6 +228,25 @@ fn unknown_path_is_404_json() {
 }
 
 #[test]
+fn a_repeated_header_name_keeps_one_entry() {
+    // The Dart shelf `Headers` map is case-insensitive with one entry per
+    // name; multi-valued headers join their values with `, `.
+    let mut response = Response::json_text(200, "{}");
+    response.set_header("Vary", "Origin");
+    response.set_header("vary", "Accept-Encoding");
+    assert_eq!(response.header("Vary"), Some("Origin, Accept-Encoding"));
+    assert_eq!(
+        response
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
+            .count(),
+        1,
+        "one entry per header name"
+    );
+}
+
+#[test]
 fn wrong_method_is_405_json() {
     let (port, shutdown) = start(crud_router());
     let answer = request(port, "PUT", "/todos", "{}");
