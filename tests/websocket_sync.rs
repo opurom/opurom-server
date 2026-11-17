@@ -4,11 +4,9 @@
 //! accepted write. The wire bytes and the event order are locked here so a
 //! generated service and a runtime adapter can reproduce the same protocol.
 
-use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::{mpsc, Arc};
-use std::thread;
+use std::sync::Arc;
 use std::time::Duration;
 
 use opurom_server::http::{Request, Response};
@@ -139,72 +137,4 @@ fn subscribers_receive_ordered_model_change_events() {
     let first = one_round();
     let second = one_round();
     assert_eq!(first, second, "two runs must emit identical bytes");
-}
-
-#[test]
-fn slow_subscriber_receives_overflow_errors_while_fast_one_keeps_up() {
-    let allowed = [
-        "{\"code\":\"queue_overflow\",\"dropped\":1,\"room\":\"Todo\",\"type\":\"error\"}",
-        "{\"code\":\"queue_overflow\",\"dropped\":2,\"room\":\"Todo\",\"type\":\"error\"}",
-    ];
-    let mut summaries = Vec::new();
-    for _ in 0..2 {
-        let (port, rooms, shutdown) = spawn_change_service();
-        // The slow client subscribes but never reads; the fast one is drained
-        // by a dedicated thread while writes are published.
-        let mut slow = subscribe(port, "Todo", Duration::from_millis(200));
-        let mut fast = subscribe(port, "Todo", Duration::from_secs(10));
-        let (tx, rx) = mpsc::channel();
-        let reader = thread::spawn(move || {
-            let (mut first, mut last) = (String::new(), String::new());
-            let mut errors = Vec::new();
-            for id in 0..300 {
-                match fast.recv() {
-                    Ok(WsMessage::Text(text)) if text.contains("\"type\":\"change\"") => {
-                        assert!(text.contains(&format!("\"n\":{id}")), "ordered changes");
-                        if id == 0 {
-                            first = text.clone();
-                        }
-                        last = text;
-                    }
-                    Ok(WsMessage::Text(text)) => errors.push(text),
-                    other => {
-                        errors.push(format!("{other:?}"));
-                        break;
-                    }
-                }
-            }
-            tx.send((first, last, errors)).expect("summary sent");
-        });
-        let pad = "x".repeat(32 * 1024);
-        for id in 0..300 {
-            rooms.publish_change("Todo", "insert", &json!({ "n": id, "pad": pad.clone() }));
-            thread::sleep(Duration::from_millis(1));
-        }
-        let (first, last, errors) = rx
-            .recv_timeout(Duration::from_secs(20))
-            .expect("reader done");
-        reader.join().expect("reader thread");
-        assert!(errors.is_empty(), "fast subscriber: {errors:?}");
-        assert!(first.contains("\"n\":0") && last.contains("\"n\":299"));
-
-        let mut seen = BTreeSet::new();
-        for _ in 0..80 {
-            match slow.recv() {
-                Ok(WsMessage::Text(text)) if text.contains("\"type\":\"error\"") => {
-                    seen.insert(text);
-                }
-                Ok(WsMessage::Text(_)) => {}
-                _ => break,
-            }
-        }
-        assert!(!seen.is_empty(), "slow subscriber is told about the drop");
-        assert!(
-            seen.iter().all(|bytes| allowed.contains(&bytes.as_str())),
-            "only fixed overflow bytes: {seen:?}"
-        );
-        summaries.push((first, last, seen));
-        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    assert_eq!(summaries[0], summaries[1], "two runs emit identical bytes");
 }

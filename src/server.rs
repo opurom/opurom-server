@@ -1386,4 +1386,79 @@ mod change_queue_tests {
             "steady overflow bytes are fixed"
         );
     }
+    fn change_id(body: &str) -> Option<u64> {
+        let start = body.find("\"id\":")? + 5;
+        let rest = &body[start..];
+        let end = rest.find(|ch: char| !ch.is_ascii_digit())?;
+        rest[..end].parse().ok()
+    }
+
+    #[test]
+    fn slow_and_fast_subscribers_stay_isolated() {
+        let run = || {
+            let hub = super::RoomHub::default();
+            let (fast_id, fast) = hub.register();
+            let (slow_id, slow) = hub.register();
+            hub.join(fast_id, "Todo").expect("fast joins");
+            hub.join(slow_id, "Todo").expect("slow joins");
+            // The fast consumer drains one frame per publish: a barrier, not a sleep.
+            let mut fast_frames = Vec::new();
+            for id in 0..100u64 {
+                assert_eq!(
+                    hub.publish_change("Todo", "insert", &super::json!(id)),
+                    2,
+                    "both subscribers accept the change"
+                );
+                fast_frames.push(text(&fast.next().expect("fast frame")));
+            }
+            slow.close();
+            let mut slow_frames = Vec::new();
+            while let Some(frame) = slow.next() {
+                slow_frames.push(text(&frame));
+            }
+            (fast_frames, slow_frames)
+        };
+        let (fast, slow) = run();
+        let (fast_again, slow_again) = run();
+        assert_eq!(
+            (&fast, &slow),
+            (&fast_again, &slow_again),
+            "two runs emit identical bytes"
+        );
+
+        assert_eq!(fast.len(), 100, "fast consumer got every change");
+        for (index, body) in fast.iter().enumerate() {
+            assert_eq!(change_id(body), Some(index as u64), "fast stays ordered");
+            assert!(body.contains("\"type\":\"change\""));
+        }
+
+        assert!(slow.len() <= MAX_CLIENT_FRAMES, "slow queue bounded");
+        assert!(
+            slow.last().is_some_and(|body| change_id(body) == Some(99)),
+            "newest change kept"
+        );
+        let changes: Vec<_> = slow
+            .iter()
+            .filter(|body| body.contains("\"type\":\"change\""))
+            .collect();
+        assert!(changes.len() < 100, "slow consumer dropped old frames");
+        let mut previous = None;
+        for body in &changes {
+            let id = change_id(body).expect("change id");
+            assert!(previous.map_or(true, |prev| id > prev), "changes ordered");
+            previous = Some(id);
+        }
+        let errors: Vec<_> = slow
+            .iter()
+            .filter(|body| body.contains("\"type\":\"error\""))
+            .collect();
+        assert!(!errors.is_empty(), "drop is reported, never silent");
+        for error in errors {
+            assert!(
+                error.contains("\"code\":\"queue_overflow\"")
+                    && (error.contains("\"dropped\":1") || error.contains("\"dropped\":2")),
+                "fixed overflow bytes: {error}"
+            );
+        }
+    }
 }
